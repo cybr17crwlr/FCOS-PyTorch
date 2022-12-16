@@ -1,0 +1,11 @@
+output_folder: "../logs"
+dataset:
+  img_folder: "../data/VOCdevkit/VOC2007/JPEGImages"
+  json_folder: "../data"
+
+# other parameters can be specified in this yaml file
+# e.g. the following lines will reset the number of training epochs to 8
+#opt:
+#  epochs: 8
+
+# see config.py for more details
