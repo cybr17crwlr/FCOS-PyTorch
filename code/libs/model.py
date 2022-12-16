@@ -70,7 +70,12 @@ class FCOSClassificationHead(nn.Module):
         Some re-arrangement of the outputs is often preferred for training / inference.
         You can choose to do it here, or in compute_loss / inference.
         """
-        return x
+        out = []
+        for i in x:
+            i = self.conv(i)
+            i = self.cls_logits(i)
+            out.append(i)
+        return out
 
 
 class FCOSRegressionHead(nn.Module):
@@ -130,7 +135,8 @@ class FCOSRegressionHead(nn.Module):
         Some re-arrangement of the outputs is often preferred for training / inference.
         You can choose to do it here, or in compute_loss / inference.
         """
-        return x, x
+        return  [self.bbox_reg(self.conv(i)) for i in x], \
+                [self.bbox_ctrness(self.conv(i)) for i in x]
 
 
 class FCOS(nn.Module):
