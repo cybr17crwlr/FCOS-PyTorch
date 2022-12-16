@@ -135,8 +135,18 @@ class FCOSRegressionHead(nn.Module):
         Some re-arrangement of the outputs is often preferred for training / inference.
         You can choose to do it here, or in compute_loss / inference.
         """
-        return  [self.bbox_reg(self.conv(i)) for i in x], \
-                [self.bbox_ctrness(self.conv(i)) for i in x]
+        regression = []
+        centerness = []
+
+        for i in x:
+            iconv = self.conv(i)
+            
+            iregress = self.bbox_reg(iconv)
+            regression.append(iregress)
+            
+            icenter = self.bbox_ctrness(iconv)
+            centerness.append(icenter)
+        return regression, centerness
 
 
 class FCOS(nn.Module):
