@@ -18,7 +18,7 @@ from .transforms import GeneralizedRCNNTransform
 
 # loss functions
 from .losses import sigmoid_focal_loss, giou_loss
-
+from torch.nn.functional import binary_cross_entropy_with_logits
 
 class FCOSClassificationHead(nn.Module):
     """
@@ -75,7 +75,6 @@ class FCOSClassificationHead(nn.Module):
         for i in x:
             i = self.conv(i)
             i = self.cls_logits(i)
-            print(i ,'init')
             out.append(i)
         
         return out
@@ -313,7 +312,6 @@ class FCOS(nn.Module):
 
         # transform the input
         images, targets = self.transform(images, targets)
-        print(images.tensors.shape, 'images')
         # get the features from the backbone
         # the result will be a dictionary {feature name : tensor}
         features = self.backbone(images.tensors)
@@ -335,7 +333,6 @@ class FCOS(nn.Module):
         # training / inference
         if self.training:
             # training: generate GT labels, and compute the loss
-            print(len(cls_logits), cls_logits[0].shape,len(reg_outputs), reg_outputs[0].shape, 'cls_logits')
             losses = self.compute_loss(
                 targets, points, strides, reg_range, cls_logits, reg_outputs, ctr_logits
             )
@@ -384,57 +381,149 @@ class FCOS(nn.Module):
     def compute_loss(
         self, targets, points, strides, reg_range, cls_logits, reg_outputs, ctr_logits
     ):
-        
-        print(len(cls_logits), cls_logits[0].shape)
 
-        for i in range(len(cls_logits)):
-            cls_logits[i] = cls_logits[i].permute((0,2,3,1))
-            reg_outputs[i] = reg_outputs[i].permute((0,2,3,1))
-            ctr_logits[i] = ctr_logits[i].permute((0,2,3,1))
-            
-        print(targets) 
-        center_radius = self.center_sampling_radius
-        print(points[0].shape, 'points')
-        matched_points = []
-        for idx,zipped in enumerate(zip(strides, points)):
-            point = zipped[1];
-            stride = zipped[0];
-            print(idx, stride, point.shape)
-            count = 0
-            center_count = 0;
-            for p_row in range(point.shape[0]):
-                for p_col in range(point.shape[1]):
-                    #print(classification_output, 'classification_output')
-                    pointX = point[p_row][p_col][0];
-                    pointY = point[p_row][p_col][1];
-                    for target in targets:
-                        for datapoint, box in enumerate(target['boxes']):
-                            targetCenterX = (box[0] + box[2])/2
-                            targetCenterY = (box[1] + box[3])/2                            
-                            targetCenterRangeLeftX = targetCenterX - center_radius*stride
-                            targetCenterRangeRightX = targetCenterX + center_radius*stride
-                            targetCenterRangeLeftY = targetCenterY - center_radius*stride
-                            targetCenterRangeRightY = targetCenterY + center_radius*stride
-                            if(targetCenterRangeLeftX < 0 or targetCenterRangeLeftY < 0):
-                                ##also bound the positives
-                                continue; 
-                            if(box[0] <= pointX and box[2] >= pointX and box[1] <= pointY and box[3] >= pointY):
-                                count = count + 1
-                                classification_output = cls_logits[idx][datapoint][p_row][p_col]
-                                print('max', classification_output)
-                                print(classification_output.shape, classification_output, 'cl_output')
-                                target_output = target['labels'][datapoint] 
-                                target_points = box;
-                                #sigmoid_focal_loss(classification_output, target_output)
-                                if(targetCenterRangeLeftX <= pointX and targetCenterRangeRightX >= pointX and targetCenterRangeLeftY <= pointY and targetCenterRangeRightY >= pointX):
-                                    center_count = center_count  + 1
-                                    reg_output = reg_outputs[idx][p_row][p_col][:][:]
-                                    ctr_logit = ctr_logits[idx][p_row][p_col][:][:]
-                                    
+        cls_loss, reg_loss, ctr_loss, final_loss = \
+            torch.Tensor([0]), torch.Tensor([0]), torch.Tensor([0]), torch.Tensor([0])
+
+        nlayers = len(cls_logits)   # 3
+        for layer in range(nlayers):
+            cls_logits[layer]   = cls_logits[layer].permute((0,2,3,1))      # N x H x W x 20
+            reg_outputs[layer]  = reg_outputs[layer].permute((0,2,3,1))     # N x H x W x 4
+            ctr_logits[layer]   = ctr_logits[layer].permute((0,2,3,1))      # N x H x W x 1
+
+        # targets       -> [ Dict {
+        #                       boxes: tensor(nboxes x 4), 
+        #                       labels: tensor(nboxes), 
+        #                       image_id: tensor(1), 
+        #                       area: tensor(1), 
+        #                       iscrowd: ??
+        #                   }] x nimages
+        # 
+        # points        -> [ meshgrid(x, y) ] x nlayers
+        # strides       -> tensor(nlayers)
+        # reg_range     -> tensor(nlayers x 2)
+        # cls_logits    -> [ tensor( N x H x W x 20) ] x nlayers
+        # reg_outputs   -> [ tensor( N x H x W x 4) ] x nlayers
+        # ctr_logits    -> [ tensor( N x H x W x 1) ] x nlayers
+
+        # for every layer
+        for layer, (layer_stride, layer_points, layer_reg_range, layer_cls_logits, layer_reg_outputs, layer_ctr_logits) in \
+            enumerate(zip(strides, points, reg_range, cls_logits, reg_outputs, ctr_logits)):
+            print(strides.shape)
+            # layer_stride      -> tensor(1)
+            # layer_points      -> tensor(H x W x 2)
+            # layer_reg_range   -> tensor(1 x 2)
+            # layer_cls_logits  -> tensor(N x H x W x 20)
+            # layer_reg_outputs -> tensor(N x H x W x 4)
+            # layer_ctr_logits  -> tensor(N x H x W x 1)
+
+            # for every image in that layer
+            for img, (img_cls_logits, img_reg_outputs, img_ctr_logits) in \
+                enumerate(zip(layer_cls_logits, layer_reg_outputs, layer_ctr_logits)):
+                # img_cls_logits    -> tensor(H x W x 20)
+                # img_reg_outputs   -> tensor(H x W x 4)
+                # img_ctr_logits    -> tensor(H x W x 1)
+                
+                positive_samples = None
+
+                # for every point in that image
+                for point, point_cls_logit, point_reg_output, point_ctr_logit in \
+                    zip(layer_points.reshape(-1, 2), 
+                        img_cls_logits.reshape(-1, 20), 
+                        img_reg_outputs.reshape(-1, 4), 
+                        img_ctr_logits.reshape(-1, 1)):
+
+                        # point             -> tensor(2)
+                        # point_cls_logit   -> tensor(20)
+                        # point_reg_output  -> tensor(4)
+                        # point_ctr_logit   -> tensor(1)
+                        
+                        # check if the reg_output lies within the reg_range
+                        if  point_reg_output.min() >= layer_reg_range[0] and \
+                            point_reg_output.max() <= layer_reg_range[1]:
+
+                            # find which target box contains this point
+                            # choose the one with least area in case of clash
+                            target_box = None
+                            target_label = None
+                            target_area = float('inf')
+
+                            x, y = point
+                                
+                            # search which box contains the point(x,y)
+                            for box, box_label, box_area in \
+                                zip(targets[img]['boxes'], targets[img]['labels'], targets[img]['area']):
+                                
+                                x1, y1, x2, y2 = box
+                                center_x = (x1 + x2) // 2
+                                center_y = (y1 + y2) // 2
+                                center_box_x1 = center_x - self.center_sampling_radius * layer_stride
+                                center_box_y1 = center_y - self.center_sampling_radius * layer_stride
+                                center_box_x2 = center_x + self.center_sampling_radius * layer_stride
+                                center_box_y2 = center_y + self.center_sampling_radius * layer_stride
+                                
+                                # check if point(x, y) lies within the target image's box
+                                if  center_box_x1 <= x <= center_box_x2 and \
+                                    center_box_y1 <= y <= center_box_y2 and \
+                                    box_area < target_area:
+                                    # save the box
+                                    target_box  = box
+                                    positive_samples = (center_box_x2-center_box_x1)* (center_box_y2-center_box_y1)
+                                    target_label = box_label.item() - 1     # convert to 0-indexed
+                                    target_area = box_area.item()
+                                
+                            # ###################
+                            # classification loss
+                            #   - points inside the sub-box are classified using one-hot encoding
+                            #   - points outside the sub-box are considered to be background
+                            # ###################
+                            target_cls_logit = torch.zeros_like(point_cls_logit)    # tensor(20)
+                            if target_label:
+                                target_cls_logit[target_label] = 1.0
                             
-            print(count, " count " , center_count)    
+                            cls_loss += sigmoid_focal_loss(point_cls_logit, target_cls_logit, reduction="sum")
+                            
+
+                            # ###################
+                            # regression loss & center-ness loss
+                            #   - points inside the target-box are regressed
+                            #   - points outside the target-box are ignored
+                            # ###################
+                            if target_label:
+                                x1, y1, x2, y2 = target_box
+                                
+                                # reverse map to get predicted x1, y1, x2, y2
+                                pred_l, pred_t, pred_r, pred_b = point_reg_output
+                                pred_x1 = x1 - pred_l * layer_stride
+                                pred_y1 = y1 - pred_t * layer_stride
+                                pred_x2 = x2 + pred_r * layer_stride
+                                pred_y2 = y2 + pred_b * layer_stride
+                                pred_box = torch.Tensor([pred_x1, pred_y1, pred_x2, pred_y2])
+
+                                reg_loss += giou_loss(pred_box, target_box, reduction="sum")
+
+                                # center-ness
+                                # TODO: check this: sometimes one of pred l, r, t, b values are 0
+                                if pred_l.item() > 0 and pred_t.item() > 0 and pred_r.item() > 0 and pred_b.item() > 0:
+                                    pred_ctr =  torch.min(pred_l, pred_r) * torch.min(pred_t, pred_b)
+                                    pred_ctr /= torch.max(pred_l, pred_r) * torch.max(pred_t, pred_b)
+                                    pred_ctr = torch.sqrt(pred_ctr).reshape(1)
+                                    ctr_loss += binary_cross_entropy_with_logits(pred_ctr, point_ctr_logit)
+                
+                # get the final loss for this image
+                # TODO: check this: verify against Eq 2
+                if positive_samples:
+                    final_loss += (cls_loss / positive_samples)
+                    final_loss += (reg_loss / positive_samples)
+                    final_loss += (ctr_loss / positive_samples)
+                            
         
-        return 0
+        return {
+            'cls_loss'  : cls_loss,
+            'reg_loss'  : reg_loss,
+            'ctr_loss'  : ctr_loss,
+            'final_loss': final_loss
+        }
 
     """
     Fill in the missing code here. The inference is also a bit involved. It is
