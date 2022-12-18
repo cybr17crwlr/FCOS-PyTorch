@@ -409,7 +409,6 @@ class FCOS(nn.Module):
         # for every layer
         for layer, (layer_stride, layer_points, layer_reg_range, layer_cls_logits, layer_reg_outputs, layer_ctr_logits) in \
             enumerate(zip(strides, points, reg_range, cls_logits, reg_outputs, ctr_logits)):
-            print(strides.shape)
             # layer_stride      -> tensor(1)
             # layer_points      -> tensor(H x W x 2)
             # layer_reg_range   -> tensor(1 x 2)
@@ -517,7 +516,7 @@ class FCOS(nn.Module):
                     final_loss += (reg_loss / positive_samples)
                     final_loss += (ctr_loss / positive_samples)
                             
-        
+        # print(cls_loss, reg_loss, ctr_loss, final_loss)
         return {
             'cls_loss'  : cls_loss,
             'reg_loss'  : reg_loss,
