@@ -70,7 +70,15 @@ class FCOSClassificationHead(nn.Module):
         Some re-arrangement of the outputs is often preferred for training / inference.
         You can choose to do it here, or in compute_loss / inference.
         """
-        return x
+        
+        out = []
+        for i in x:
+            i = self.conv(i)
+            i = self.cls_logits(i)
+            print(i ,'init')
+            out.append(i)
+        
+        return out
 
 
 class FCOSRegressionHead(nn.Module):
@@ -130,7 +138,16 @@ class FCOSRegressionHead(nn.Module):
         Some re-arrangement of the outputs is often preferred for training / inference.
         You can choose to do it here, or in compute_loss / inference.
         """
-        return x, x
+        regression = []
+        centerness = []
+        for i in x:
+            iconv = self.conv(i)
+            iregress = self.bbox_reg(iconv)
+            regression.append(iregress)
+            icenter = self.bbox_ctrness(iconv)
+            centerness.append(icenter)
+            
+        return regression, centerness
 
 
 class FCOS(nn.Module):
@@ -296,7 +313,7 @@ class FCOS(nn.Module):
 
         # transform the input
         images, targets = self.transform(images, targets)
-
+        print(images.tensors.shape, 'images')
         # get the features from the backbone
         # the result will be a dictionary {feature name : tensor}
         features = self.backbone(images.tensors)
@@ -318,6 +335,7 @@ class FCOS(nn.Module):
         # training / inference
         if self.training:
             # training: generate GT labels, and compute the loss
+            print(len(cls_logits), cls_logits[0].shape,len(reg_outputs), reg_outputs[0].shape, 'cls_logits')
             losses = self.compute_loss(
                 targets, points, strides, reg_range, cls_logits, reg_outputs, ctr_logits
             )
@@ -366,7 +384,57 @@ class FCOS(nn.Module):
     def compute_loss(
         self, targets, points, strides, reg_range, cls_logits, reg_outputs, ctr_logits
     ):
-        return losses
+        
+        print(len(cls_logits), cls_logits[0].shape)
+
+        for i in range(len(cls_logits)):
+            cls_logits[i] = cls_logits[i].permute((0,2,3,1))
+            reg_outputs[i] = reg_outputs[i].permute((0,2,3,1))
+            ctr_logits[i] = ctr_logits[i].permute((0,2,3,1))
+            
+        print(targets) 
+        center_radius = self.center_sampling_radius
+        print(points[0].shape, 'points')
+        matched_points = []
+        for idx,zipped in enumerate(zip(strides, points)):
+            point = zipped[1];
+            stride = zipped[0];
+            print(idx, stride, point.shape)
+            count = 0
+            center_count = 0;
+            for p_row in range(point.shape[0]):
+                for p_col in range(point.shape[1]):
+                    #print(classification_output, 'classification_output')
+                    pointX = point[p_row][p_col][0];
+                    pointY = point[p_row][p_col][1];
+                    for target in targets:
+                        for datapoint, box in enumerate(target['boxes']):
+                            targetCenterX = (box[0] + box[2])/2
+                            targetCenterY = (box[1] + box[3])/2                            
+                            targetCenterRangeLeftX = targetCenterX - center_radius*stride
+                            targetCenterRangeRightX = targetCenterX + center_radius*stride
+                            targetCenterRangeLeftY = targetCenterY - center_radius*stride
+                            targetCenterRangeRightY = targetCenterY + center_radius*stride
+                            if(targetCenterRangeLeftX < 0 or targetCenterRangeLeftY < 0):
+                                ##also bound the positives
+                                continue; 
+                            if(box[0] <= pointX and box[2] >= pointX and box[1] <= pointY and box[3] >= pointY):
+                                count = count + 1
+                                classification_output = cls_logits[idx][datapoint][p_row][p_col]
+                                print('max', classification_output)
+                                print(classification_output.shape, classification_output, 'cl_output')
+                                target_output = target['labels'][datapoint] 
+                                target_points = box;
+                                #sigmoid_focal_loss(classification_output, target_output)
+                                if(targetCenterRangeLeftX <= pointX and targetCenterRangeRightX >= pointX and targetCenterRangeLeftY <= pointY and targetCenterRangeRightY >= pointX):
+                                    center_count = center_count  + 1
+                                    reg_output = reg_outputs[idx][p_row][p_col][:][:]
+                                    ctr_logit = ctr_logits[idx][p_row][p_col][:][:]
+                                    
+                            
+            print(count, " count " , center_count)    
+        
+        return 0
 
     """
     Fill in the missing code here. The inference is also a bit involved. It is
