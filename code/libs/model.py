@@ -423,7 +423,7 @@ class FCOS(nn.Module):
                 # img_reg_outputs   -> tensor(H x W x 4)
                 # img_ctr_logits    -> tensor(H x W x 1)
                 
-                positive_samples = None
+                positive_samples = 0
 
                 # for every point in that image
                 for point, point_cls_logit, point_reg_output, point_ctr_logit in \
@@ -436,19 +436,17 @@ class FCOS(nn.Module):
                         # point_cls_logit   -> tensor(20)
                         # point_reg_output  -> tensor(4)
                         # point_ctr_logit   -> tensor(1)
-                        
+
+                        # find which target box contains this point
+                        # choose the one with least area in case of clash
+                        target_box = None
+                        target_label = None
+                        target_area = float('inf')                        
+                        x, y = point
+
                         # check if the reg_output lies within the reg_range
-                        if  point_reg_output.min() >= layer_reg_range[0] and \
-                            point_reg_output.max() <= layer_reg_range[1]:
+                        if layer_reg_range[0] <= point_reg_output.max() <= layer_reg_range[1]:
 
-                            # find which target box contains this point
-                            # choose the one with least area in case of clash
-                            target_box = None
-                            target_label = None
-                            target_area = float('inf')
-
-                            x, y = point
-                                
                             # search which box contains the point(x,y)
                             for box, box_label, box_area in \
                                 zip(targets[img]['boxes'], targets[img]['labels'], targets[img]['area']):
@@ -467,54 +465,53 @@ class FCOS(nn.Module):
                                     box_area < target_area:
                                     # save the box
                                     target_box  = box
-                                    positive_samples = (center_box_x2-center_box_x1)* (center_box_y2-center_box_y1)
+                                    positive_samples += 1
                                     target_label = box_label.item() - 1     # convert to 0-indexed
                                     target_area = box_area.item()
                                 
-                            # ###################
-                            # classification loss
-                            #   - points inside the sub-box are classified using one-hot encoding
-                            #   - points outside the sub-box are considered to be background
-                            # ###################
-                            target_cls_logit = torch.zeros_like(point_cls_logit)    # tensor(20)
-                            if target_label:
-                                target_cls_logit[target_label] = 1.0
+                        # ###################
+                        # classification loss
+                        #   - points inside the sub-box are classified using one-hot encoding
+                        #   - points outside the sub-box are considered to be background
+                        # ###################
+                        target_cls_logit = torch.zeros_like(point_cls_logit)    # tensor(20)
+                        if target_label is not None:
+                            target_cls_logit[target_label] = 1.0
+                        
+                        cls_loss += sigmoid_focal_loss(point_cls_logit, target_cls_logit, reduction="sum")
+
+                        # ###################
+                        # regression loss & center-ness loss
+                        #   - points inside the target-box are regressed
+                        #   - points outside the target-box are ignored
+                        # ###################
+                        if target_label is not None:
+                            x1, y1, x2, y2 = target_box
                             
-                            cls_loss += sigmoid_focal_loss(point_cls_logit, target_cls_logit, reduction="sum")
-                            
+                            # reverse map to get predicted x1, y1, x2, y2
+                            pred_l, pred_t, pred_r, pred_b = point_reg_output
+                            pred_x1 = x1 - pred_l * layer_stride
+                            pred_y1 = y1 - pred_t * layer_stride
+                            pred_x2 = x2 + pred_r * layer_stride
+                            pred_y2 = y2 + pred_b * layer_stride
+                            pred_box = torch.Tensor([pred_x1, pred_y1, pred_x2, pred_y2])
 
-                            # ###################
-                            # regression loss & center-ness loss
-                            #   - points inside the target-box are regressed
-                            #   - points outside the target-box are ignored
-                            # ###################
-                            if target_label:
-                                x1, y1, x2, y2 = target_box
-                                
-                                # reverse map to get predicted x1, y1, x2, y2
-                                pred_l, pred_t, pred_r, pred_b = point_reg_output
-                                pred_x1 = x1 - pred_l * layer_stride
-                                pred_y1 = y1 - pred_t * layer_stride
-                                pred_x2 = x2 + pred_r * layer_stride
-                                pred_y2 = y2 + pred_b * layer_stride
-                                pred_box = torch.Tensor([pred_x1, pred_y1, pred_x2, pred_y2])
+                            reg_loss += giou_loss(pred_box, target_box, reduction="sum")
 
-                                reg_loss += giou_loss(pred_box, target_box, reduction="sum")
-
-                                # center-ness
-                                # TODO: check this: sometimes one of pred l, r, t, b values are 0
-                                if pred_l.item() > 0 and pred_t.item() > 0 and pred_r.item() > 0 and pred_b.item() > 0:
-                                    pred_ctr =  torch.min(pred_l, pred_r) * torch.min(pred_t, pred_b)
-                                    pred_ctr /= torch.max(pred_l, pred_r) * torch.max(pred_t, pred_b)
-                                    pred_ctr = torch.sqrt(pred_ctr).reshape(1)
-                                    ctr_loss += binary_cross_entropy_with_logits(pred_ctr, point_ctr_logit)
+                            # center-ness
+                            if (torch.max(pred_l, pred_r).item() > 0) and (torch.max(pred_t, pred_b).item() > 0):
+                                pred_ctr =  torch.min(pred_l, pred_r) * torch.min(pred_t, pred_b)
+                                pred_ctr /= torch.max(pred_l, pred_r) * torch.max(pred_t, pred_b)
+                                pred_ctr = torch.sqrt(pred_ctr).reshape(1)
+                                ctr_loss += binary_cross_entropy_with_logits(point_ctr_logit, pred_ctr)
                 
                 # get the final loss for this image
                 # TODO: check this: verify against Eq 2
-                if positive_samples:
-                    final_loss += (cls_loss / positive_samples)
-                    final_loss += (reg_loss / positive_samples)
-                    final_loss += (ctr_loss / positive_samples)
+                positive_samples += (layer_points.shape[0] * layer_points.shape[1])
+                final_loss += (cls_loss / positive_samples)
+                final_loss += (reg_loss / positive_samples)
+                final_loss += (ctr_loss / positive_samples)
+                print(cls_loss, reg_loss, ctr_loss, final_loss, positive_samples)
                             
         # print(cls_loss, reg_loss, ctr_loss, final_loss)
         return {
