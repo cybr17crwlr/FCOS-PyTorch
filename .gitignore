@@ -3,4 +3,3 @@ data
 **/__pycache__
 logs/
 .vscode
-code/libs/config.py
