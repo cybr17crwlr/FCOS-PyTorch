@@ -382,7 +382,8 @@ class FCOS(nn.Module):
         self, targets, points, strides, reg_range, cls_logits, reg_outputs, ctr_logits
     ):
 
-        final_loss = torch.Tensor([0]).to("cuda")
+        global_cls_loss, global_reg_loss, global_ctr_loss = \
+            torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda")
 
         nlayers = len(cls_logits)   # 3
         for layer in range(nlayers):
@@ -423,7 +424,7 @@ class FCOS(nn.Module):
                 # img_ctr_logits    -> tensor(H x W x 1)
                 
                 positive_samples = 0
-                reg_loss, cls_loss, ctr_loss = torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda"),
+                cls_loss, reg_loss, ctr_loss = torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda")
                 # for every point in that image
                 for point, point_cls_logit, point_reg_output, point_ctr_logit in \
                     zip(layer_points.reshape(-1, 2), 
@@ -441,6 +442,7 @@ class FCOS(nn.Module):
                         x, y = point
                         
                         target_box = None
+                        target_center = None
                         target_label = None
                         target_area = float('inf')
                         
@@ -465,6 +467,7 @@ class FCOS(nn.Module):
                                     box_area < target_area:
                                     # save the box
                                     target_box  = box
+                                    target_center = torch.Tensor([center_x, center_y, center_x, center_y]).to("cuda")
                                     positive_samples += 1
                                     target_label = box_label.item() - 1     # convert to 0-indexed
                                     target_area = box_area.item()
@@ -495,7 +498,7 @@ class FCOS(nn.Module):
                             # pred_y1 = y1 - pred_t * layer_stride
                             # pred_x2 = x2 + pred_r * layer_stride
                             # pred_y2 = y2 + pred_b * layer_stride
-                            reg_loss += giou_loss(target_box + (point_reg_output * layer_stride * torch.Tensor([-1,-1,1,1]).to('cuda')), target_box, reduction="sum")
+                            reg_loss += giou_loss(target_center + (point_reg_output * layer_stride * torch.Tensor([-1,-1,1,1]).to('cuda')), target_box, reduction="sum")
 
                             #reg_loss += giou_loss(pred_box, target_box, reduction="sum")
 
@@ -510,16 +513,16 @@ class FCOS(nn.Module):
                 # get the final loss for this image
                 # TODO: check this: verify against Eq 2
                 positive_samples = max(positive_samples, 1)
-                final_loss += (cls_loss / positive_samples)
-                final_loss += (reg_loss / positive_samples)
-                final_loss += (ctr_loss / positive_samples)
+                global_cls_loss += (cls_loss / positive_samples)
+                global_reg_loss += (reg_loss / positive_samples)
+                global_ctr_loss += (ctr_loss/ positive_samples)
                             
         # print(cls_loss, reg_loss, ctr_loss, final_loss)
         return {
-            'cls_loss'  : cls_loss,
-            'reg_loss'  : reg_loss,
-            'ctr_loss'  : ctr_loss,
-            'final_loss': final_loss
+            'cls_loss'  : global_cls_loss,
+            'reg_loss'  : global_reg_loss,
+            'ctr_loss'  : global_ctr_loss,
+            'final_loss': global_cls_loss + global_reg_loss + global_ctr_loss
         }
 
     """
