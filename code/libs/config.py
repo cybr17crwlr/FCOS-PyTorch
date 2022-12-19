@@ -4,7 +4,7 @@ import yaml
 # the parameters here will be overwritten if a yaml config is specified
 DEFAULTS = {
     # default: single gpu
-    "devices": ["cpu"],
+    "devices": ["cuda"],
     "model_name": "FCOS",
     # output folder that stores all log files and checkpoints
     "output_folder": None,
