@@ -5,6 +5,7 @@ import torchvision
 from torchvision.models import resnet18, ResNet18_Weights
 from torchvision.models.feature_extraction import create_feature_extractor
 from torchvision.ops.feature_pyramid_network import FeaturePyramidNetwork
+from torchvision.ops import clip_boxes_to_image
 from torchvision.ops.boxes import batched_nms
 
 import torch
@@ -559,4 +560,67 @@ class FCOS(nn.Module):
     def inference(
         self, points, strides, cls_logits, reg_outputs, ctr_logits, image_shapes
     ):
+        detections = []
+        num_of_images = len(image_shapes)
+        #TODO Can image be matricied
+        for index in range(num_of_images):
+            boxes = []
+            scores = []
+            labels = []
+            combination = []
+            for layer_stride, box_regression_per_image_per_level, logits_per_image_per_level, box_ctrness_image_per_level, points_per_level in zip(strides, reg_outputs, cls_logits, ctr_logits, points):
+               
+                box_regression_per_image = box_regression_per_image_per_level[index]
+                logits_per_image = logits_per_image_per_level[index]
+                box_ctrness_per_image = box_ctrness_image_per_level[index]
+           
+                scores_per_level = torch.sqrt(
+                torch.sigmoid(logits_per_image) * torch.sigmoid(box_ctrness_per_image)).flatten()
+                print(scores_per_level.shape)
+               
+                keep_idxs = scores_per_level > self.score_thresh
+                scores_per_level = scores_per_level
+                topk_idxs = torch.where(keep_idxs)[0] ##INDEXES
+               
+                #TODO: Decode all boxes , then filtering ( reverse this )
+                pred_l, pred_t, pred_r, pred_b = box_regression_per_image
+                centerx = points_per_level[:,:,0]
+                centery = points_per_level[:,:,1]
+                x1 = centerx - pred_l * layer_stride 
+                y1 = centery - pred_b * layer_stride
+                x2 = centerx + pred_r * layer_stride 
+                y2 = centery + pred_t * layer_stride
+                boxes_per_level = clip_boxes_to_image(torch.stack([x1,y1,x2,y2]).permute(1,2,0) , image_shapes[index]).reshape(-1,4)
+                box_idxs = torch.div(topk_idxs, 20, rounding_mode="floor")
+               
+                scores.append(scores_per_level[keep_idxs])
+                boxes.append(boxes_per_level[box_idxs])
+                labels.append(topk_idxs%20)
+             
+            scores = torch.cat(scores, dim=0)
+            boxes = torch.cat(boxes, dim=0)
+            labels = torch.cat(labels, dim=0)  
+           
+            if(self.topk_candidates > scores.shape[0]):
+                detections.append(
+                    {
+                        "boxes": boxes,
+                        "scores": scores, #TODO shd we sort ??
+                        "labels": labels,
+                    }
+                )
+            else:
+                sorted_scores = torch.argsort(scores, descending=True)
+                boxes = boxes[sorted_scores][:self.topk_candidates]   #This works like pipe ??
+                scores = scores[sorted_scores][:self.topk_candidates]  
+                labels = labels[sorted_scores][:self.topk_candidates]  
+               
+                detections.append(
+                    {
+                        "boxes": boxes,
+                        "scores": scores,
+                        "labels": labels,
+                    }
+                )
+           
         return detections
