@@ -382,8 +382,8 @@ class FCOS(nn.Module):
         self, targets, points, strides, reg_range, cls_logits, reg_outputs, ctr_logits
     ):
 
-        global_cls_loss, global_reg_loss, global_ctr_loss = \
-            torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda")
+        positive_samples = 0
+        cls_loss, reg_loss, ctr_loss = torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda")
 
         nlayers = len(cls_logits)   # 3
         for layer in range(nlayers):
@@ -423,8 +423,7 @@ class FCOS(nn.Module):
                 # img_reg_outputs   -> tensor(H x W x 4)
                 # img_ctr_logits    -> tensor(H x W x 1)
                 
-                positive_samples = 0
-                cls_loss, reg_loss, ctr_loss = torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda")
+                
                 # for every point in that image
                 for point, point_cls_logit, point_reg_output, point_ctr_logit in \
                     zip(layer_points.reshape(-1, 2), 
@@ -445,32 +444,47 @@ class FCOS(nn.Module):
                         target_center = None
                         target_label = None
                         target_area = float('inf')
-                        
-                        # check if the reg_output lies within the reg_range
-                        if layer_reg_range[0] <= point_reg_output.max() <= layer_reg_range[1]:
+                        target_box_ll = None
+                        target_box_tt = None
+                        target_box_rr = None
+                        target_box_bb = None
 
-                            # search which box contains the point(x,y)
-                            for box, box_label, box_area in \
-                                zip(targets[img]['boxes'], targets[img]['labels'], targets[img]['area']):
-                                
-                                x1, y1, x2, y2 = box
-                                center_x = (x1 + x2) // 2
-                                center_y = (y1 + y2) // 2
-                                center_box_x1 = center_x - self.center_sampling_radius * layer_stride
-                                center_box_y1 = center_y - self.center_sampling_radius * layer_stride
-                                center_box_x2 = center_x + self.center_sampling_radius * layer_stride
-                                center_box_y2 = center_y + self.center_sampling_radius * layer_stride
-                                
-                                # check if point(x, y) lies within the target image's box
-                                if  center_box_x1 <= x <= center_box_x2 and \
-                                    center_box_y1 <= y <= center_box_y2 and \
+                        # search which box contains the point(x,y)
+                        for box, box_label, box_area in \
+                            zip(targets[img]['boxes'], targets[img]['labels'], targets[img]['area']):
+
+                            x1, y1, x2, y2 = box
+                            center_x = (x1 + x2) / 2
+                            center_y = (y1 + y2) / 2
+                            center_box = torch.Tensor([center_x, center_y, center_x, center_y]).to('cuda') + (self.center_sampling_radius * layer_stride * torch.Tensor([-1,-1,1,1]).to('cuda'))
+                            center_box.detach()
+
+                            ll = (center_x - x1) / layer_stride
+                            tt = (center_y - y1) / layer_stride
+                            rr = (x2 - center_x) / layer_stride
+                            bb = (y2 - center_y) / layer_stride
+                            ll.detach()
+                            tt.detach()
+                            rr.detach()
+                            bb.detach()
+                            
+                            # check if the reg_output lies within the reg_range
+                            if layer_reg_range[0] <= max(ll, tt, rr, bb) <= layer_reg_range[1]:
+                            
+                                # check if point(x, y) lies within the target image's center box
+                                if  center_box[0] <= x <= center_box[2] and \
+                                    center_box[1] <= y <= center_box[3] and \
                                     box_area < target_area:
                                     # save the box
                                     target_box  = box
-                                    target_center = torch.Tensor([center_x, center_y, center_x, center_y]).to("cuda")
+                                    target_center = torch.Tensor([center_x, center_y, center_x, center_y]).to("cuda").detach()
                                     positive_samples += 1
                                     target_label = box_label.item() - 1     # convert to 0-indexed
                                     target_area = box_area.item()
+                                    target_box_ll = ll
+                                    target_box_tt = tt
+                                    target_box_rr = rr
+                                    target_box_bb = bb
                                 
                         # ###################
                         # classification loss
@@ -492,37 +506,21 @@ class FCOS(nn.Module):
                         if target_label is not None:
                             x1, y1, x2, y2 = target_box
                             
-                            # reverse map to get predicted x1, y1, x2, y2
-                            pred_l, pred_t, pred_r, pred_b = point_reg_output
-                            # pred_x1 = x1 - pred_l * layer_stride
-                            # pred_y1 = y1 - pred_t * layer_stride
-                            # pred_x2 = x2 + pred_r * layer_stride
-                            # pred_y2 = y2 + pred_b * layer_stride
                             reg_loss += giou_loss(target_center + (point_reg_output * layer_stride * torch.Tensor([-1,-1,1,1]).to('cuda')), target_box, reduction="sum")
-
-                            #reg_loss += giou_loss(pred_box, target_box, reduction="sum")
 
                             # center-ness
                             # TODO: check this: sometimes one of pred l, r, t, b values are 0
-                            if pred_l.item() > 0 and pred_t.item() > 0 and pred_r.item() > 0 and pred_b.item() > 0:
-                                pred_ctr =  torch.min(pred_l, pred_r) * torch.min(pred_t, pred_b)
-                                pred_ctr /= torch.max(pred_l, pred_r) * torch.max(pred_t, pred_b)
-                                pred_ctr = torch.sqrt(pred_ctr).reshape(1)
-                                ctr_loss += binary_cross_entropy_with_logits(point_ctr_logit, pred_ctr)
-                
-                # get the final loss for this image
-                # TODO: check this: verify against Eq 2
-                positive_samples = max(positive_samples, 1)
-                global_cls_loss += (cls_loss / positive_samples)
-                global_reg_loss += (reg_loss / positive_samples)
-                global_ctr_loss += (ctr_loss/ positive_samples)
-                            
-        # print(cls_loss, reg_loss, ctr_loss, final_loss)
+                            pred_ctr =  torch.min(target_box_ll, target_box_rr) * torch.min(target_box_tt, target_box_bb)
+                            pred_ctr /=  torch.max(target_box_ll, target_box_rr) * torch.max(target_box_tt, target_box_bb)
+                            pred_ctr = torch.sqrt(pred_ctr).reshape(1).detach()
+                            ctr_loss += binary_cross_entropy_with_logits(point_ctr_logit, pred_ctr)
+
+        positive_samples = max(positive_samples,1)
         return {
-            'cls_loss'  : global_cls_loss,
-            'reg_loss'  : global_reg_loss,
-            'ctr_loss'  : global_ctr_loss,
-            'final_loss': global_cls_loss + global_reg_loss + global_ctr_loss
+            'cls_loss'  : cls_loss/positive_samples,
+            'reg_loss'  : reg_loss/positive_samples,
+            'ctr_loss'  : ctr_loss/positive_samples,
+            'final_loss': (cls_loss + reg_loss + ctr_loss)/positive_samples
         }
 
     """
