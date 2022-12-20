@@ -18,7 +18,7 @@ from .transforms import GeneralizedRCNNTransform
 
 # loss functions
 from .losses import sigmoid_focal_loss, giou_loss
-
+from torch.nn.functional import binary_cross_entropy_with_logits
 
 class FCOSClassificationHead(nn.Module):
     """
@@ -70,7 +70,14 @@ class FCOSClassificationHead(nn.Module):
         Some re-arrangement of the outputs is often preferred for training / inference.
         You can choose to do it here, or in compute_loss / inference.
         """
-        return x
+        
+        out = []
+        for i in x:
+            i = self.conv(i)
+            i = self.cls_logits(i)
+            out.append(i)
+        
+        return out
 
 
 class FCOSRegressionHead(nn.Module):
@@ -130,7 +137,16 @@ class FCOSRegressionHead(nn.Module):
         Some re-arrangement of the outputs is often preferred for training / inference.
         You can choose to do it here, or in compute_loss / inference.
         """
-        return x, x
+        regression = []
+        centerness = []
+        for i in x:
+            iconv = self.conv(i)
+            iregress = self.bbox_reg(iconv)
+            regression.append(iregress)
+            icenter = self.bbox_ctrness(iconv)
+            centerness.append(icenter)
+            
+        return regression, centerness
 
 
 class FCOS(nn.Module):
@@ -296,7 +312,6 @@ class FCOS(nn.Module):
 
         # transform the input
         images, targets = self.transform(images, targets)
-
         # get the features from the backbone
         # the result will be a dictionary {feature name : tensor}
         features = self.backbone(images.tensors)
@@ -366,7 +381,149 @@ class FCOS(nn.Module):
     def compute_loss(
         self, targets, points, strides, reg_range, cls_logits, reg_outputs, ctr_logits
     ):
-        return losses
+
+        global_cls_loss, global_reg_loss, global_ctr_loss = \
+            torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda")
+
+        nlayers = len(cls_logits)   # 3
+        for layer in range(nlayers):
+            cls_logits[layer]   = cls_logits[layer].permute((0,2,3,1))      # N x H x W x 20
+            reg_outputs[layer]  = reg_outputs[layer].permute((0,2,3,1))     # N x H x W x 4
+            ctr_logits[layer]   = ctr_logits[layer].permute((0,2,3,1))      # N x H x W x 1
+
+        # targets       -> [ Dict {
+        #                       boxes: tensor(nboxes x 4), 
+        #                       labels: tensor(nboxes), 
+        #                       image_id: tensor(1), 
+        #                       area: tensor(1), 
+        #                       iscrowd: ??
+        #                   }] x nimages
+        # 
+        # points        -> [ meshgrid(x, y) ] x nlayers
+        # strides       -> tensor(nlayers)
+        # reg_range     -> tensor(nlayers x 2)
+        # cls_logits    -> [ tensor( N x H x W x 20) ] x nlayers
+        # reg_outputs   -> [ tensor( N x H x W x 4) ] x nlayers
+        # ctr_logits    -> [ tensor( N x H x W x 1) ] x nlayers
+
+        # for every layer
+        for layer, (layer_stride, layer_points, layer_reg_range, layer_cls_logits, layer_reg_outputs, layer_ctr_logits) in \
+            enumerate(zip(strides, points, reg_range, cls_logits, reg_outputs, ctr_logits)):
+            # layer_stride      -> tensor(1)
+            # layer_points      -> tensor(H x W x 2)
+            # layer_reg_range   -> tensor(1 x 2)
+            # layer_cls_logits  -> tensor(N x H x W x 20)
+            # layer_reg_outputs -> tensor(N x H x W x 4)
+            # layer_ctr_logits  -> tensor(N x H x W x 1)
+
+            # for every image in that layer
+            for img, (img_cls_logits, img_reg_outputs, img_ctr_logits) in \
+                enumerate(zip(layer_cls_logits, layer_reg_outputs, layer_ctr_logits)):
+                # img_cls_logits    -> tensor(H x W x 20)
+                # img_reg_outputs   -> tensor(H x W x 4)
+                # img_ctr_logits    -> tensor(H x W x 1)
+                
+                positive_samples = 0
+                cls_loss, reg_loss, ctr_loss = torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda")
+                # for every point in that image
+                for point, point_cls_logit, point_reg_output, point_ctr_logit in \
+                    zip(layer_points.reshape(-1, 2), 
+                        img_cls_logits.reshape(-1, 20), 
+                        img_reg_outputs.reshape(-1, 4), 
+                        img_ctr_logits.reshape(-1, 1)):
+
+                        # point             -> tensor(2)
+                        # point_cls_logit   -> tensor(20)
+                        # point_reg_output  -> tensor(4)
+                        # point_ctr_logit   -> tensor(1)
+
+                        # find which target box contains this point
+                        # choose the one with least area in case of clash
+                        x, y = point
+                        
+                        target_box = None
+                        target_center = None
+                        target_label = None
+                        target_area = float('inf')
+                        
+                        # check if the reg_output lies within the reg_range
+                        if layer_reg_range[0] <= point_reg_output.max() <= layer_reg_range[1]:
+
+                            # search which box contains the point(x,y)
+                            for box, box_label, box_area in \
+                                zip(targets[img]['boxes'], targets[img]['labels'], targets[img]['area']):
+                                
+                                x1, y1, x2, y2 = box
+                                center_x = (x1 + x2) // 2
+                                center_y = (y1 + y2) // 2
+                                center_box_x1 = center_x - self.center_sampling_radius * layer_stride
+                                center_box_y1 = center_y - self.center_sampling_radius * layer_stride
+                                center_box_x2 = center_x + self.center_sampling_radius * layer_stride
+                                center_box_y2 = center_y + self.center_sampling_radius * layer_stride
+                                
+                                # check if point(x, y) lies within the target image's box
+                                if  center_box_x1 <= x <= center_box_x2 and \
+                                    center_box_y1 <= y <= center_box_y2 and \
+                                    box_area < target_area:
+                                    # save the box
+                                    target_box  = box
+                                    target_center = torch.Tensor([center_x, center_y, center_x, center_y]).to("cuda")
+                                    positive_samples += 1
+                                    target_label = box_label.item() - 1     # convert to 0-indexed
+                                    target_area = box_area.item()
+                                
+                        # ###################
+                        # classification loss
+                        #   - points inside the sub-box are classified using one-hot encoding
+                        #   - points outside the sub-box are considered to be background
+                        # ###################
+                        target_cls_logit = torch.zeros_like(point_cls_logit)    # tensor(20)
+                        if target_label is not None:
+                            target_cls_logit[target_label] = 1.0
+                        
+                        cls_loss += sigmoid_focal_loss(point_cls_logit, target_cls_logit, reduction="sum")
+                        
+
+                        # ###################
+                        # regression loss & center-ness loss
+                        #   - points inside the target-box are regressed
+                        #   - points outside the target-box are ignored
+                        # ###################
+                        if target_label is not None:
+                            x1, y1, x2, y2 = target_box
+                            
+                            # reverse map to get predicted x1, y1, x2, y2
+                            pred_l, pred_t, pred_r, pred_b = point_reg_output
+                            # pred_x1 = x1 - pred_l * layer_stride
+                            # pred_y1 = y1 - pred_t * layer_stride
+                            # pred_x2 = x2 + pred_r * layer_stride
+                            # pred_y2 = y2 + pred_b * layer_stride
+                            reg_loss += giou_loss(target_center + (point_reg_output * layer_stride * torch.Tensor([-1,-1,1,1]).to('cuda')), target_box, reduction="sum")
+
+                            #reg_loss += giou_loss(pred_box, target_box, reduction="sum")
+
+                            # center-ness
+                            # TODO: check this: sometimes one of pred l, r, t, b values are 0
+                            if pred_l.item() > 0 and pred_t.item() > 0 and pred_r.item() > 0 and pred_b.item() > 0:
+                                pred_ctr =  torch.min(pred_l, pred_r) * torch.min(pred_t, pred_b)
+                                pred_ctr /= torch.max(pred_l, pred_r) * torch.max(pred_t, pred_b)
+                                pred_ctr = torch.sqrt(pred_ctr).reshape(1)
+                                ctr_loss += binary_cross_entropy_with_logits(point_ctr_logit, pred_ctr)
+                
+                # get the final loss for this image
+                # TODO: check this: verify against Eq 2
+                positive_samples = max(positive_samples, 1)
+                global_cls_loss += (cls_loss / positive_samples)
+                global_reg_loss += (reg_loss / positive_samples)
+                global_ctr_loss += (ctr_loss/ positive_samples)
+                            
+        # print(cls_loss, reg_loss, ctr_loss, final_loss)
+        return {
+            'cls_loss'  : global_cls_loss,
+            'reg_loss'  : global_reg_loss,
+            'ctr_loss'  : global_ctr_loss,
+            'final_loss': global_cls_loss + global_reg_loss + global_ctr_loss
+        }
 
     """
     Fill in the missing code here. The inference is also a bit involved. It is

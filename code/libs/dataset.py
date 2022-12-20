@@ -100,7 +100,7 @@ def build_dataloader(dataset, is_training, batch_size, num_workers):
         num_workers=num_workers,
         collate_fn=trivial_batch_collator,
         worker_init_fn=(worker_init_reset_seed if is_training else None),
-        shuffle=is_training,
+        shuffle=True,
         drop_last=is_training,
         persistent_workers=True,
     )

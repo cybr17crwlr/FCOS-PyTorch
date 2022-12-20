@@ -4,7 +4,7 @@ import yaml
 # the parameters here will be overwritten if a yaml config is specified
 DEFAULTS = {
     # default: single gpu
-    "devices": ["cuda:0"],
+    "devices": ["cuda"],
     "model_name": "FCOS",
     # output folder that stores all log files and checkpoints
     "output_folder": None,
@@ -19,7 +19,7 @@ DEFAULTS = {
     },
     "loader": {
         "batch_size": 4,
-        "num_workers": 4,
+        "num_workers": 1
     },
     "input": {
         # min / max size of the input image
