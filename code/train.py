@@ -68,7 +68,7 @@ def main(args):
 
     """3. create model, optimizer, and scheduler"""
     # model
-    model = FCOS(**cfg["model"]).to(torch.device(cfg["devices"][0]))
+    model = FCOS(**cfg["model"], devices=cfg["devices"]).to(torch.device(cfg["devices"][0]))
     # optimizer
     optimizer = build_optimizer(model, cfg["opt"])
     # schedule
