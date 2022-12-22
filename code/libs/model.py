@@ -787,32 +787,26 @@ class FCOS(nn.Module):
                
                 scores.append(scores_per_level[keep_idxs])
                 boxes.append(boxes_per_level[box_idxs])
-                labels.append(topk_idxs%20)
+                labels.append(topk_idxs%20 + 1) #OFFSET append
              
             scores = torch.cat(scores, dim=0)
             boxes = torch.cat(boxes, dim=0)
             labels = torch.cat(labels, dim=0)  
-           
-            if(self.topk_candidates > scores.shape[0]):
-                detections.append(
-                    {
-                        "boxes": boxes,
-                        "scores": scores, #TODO shd we sort ??
-                        "labels": labels,
-                    }
-                )
-            else:
-                sorted_scores = torch.argsort(scores, descending=True)
-                boxes = boxes[sorted_scores][:self.topk_candidates]   #This works like pipe ??
-                scores = scores[sorted_scores][:self.topk_candidates]  
-                labels = labels[sorted_scores][:self.topk_candidates]  
-               
-                detections.append(
-                    {
-                        "boxes": boxes,
-                        "scores": scores,
-                        "labels": labels,
-                    }
-                )
-           
+            
+            scores, idx = scores.topk(min(scores.size(0), self.topk_candidates))
+            print(idx.shape, 'idx count')
+            boxes = boxes[idx]
+            labels = labels[idx]
+
+            filtered_set = batched_nms(boxes, scores, labels, self.nms_thresh)
+            
+            filtered_set = filtered_set[: self.detections_per_img]
+            print(labels[filtered_set].shape, "final length")
+            detections.append(
+                {
+                    'boxes': boxes[filtered_set],
+                    'scores': scores[filtered_set],
+                    'labels': labels[filtered_set]
+                }
+            )
         return detections
