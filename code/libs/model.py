@@ -400,10 +400,10 @@ class FCOS(nn.Module):
             ctr_logits[layer]   = ctr_logits[layer].permute((0,2,3,1))      # N_images x H x W x 1
 
         for image, targets_per_image in enumerate(targets):
-            target_boxes    = targets_per_image['boxes']                    # N_boxes x 4   (x1,y1,x2,y2)
-            target_label    = targets_per_image['labels']                   # N_boxes x 1   (class in range [1:20])
-            target_areas    = (target_boxes[:,2] - target_boxes[:,0]) * (target_boxes[:,3] - target_boxes[:,1])               # N_boxes x 1   (area)
-            target_centers  = (target_boxes[:,:2] + target_boxes[:,2:]) / 2 # N_boxes x 2   (x,y)
+            target_boxes    = targets_per_image['boxes']                                                                # N_boxes x 4   (x1,y1,x2,y2)
+            target_label    = targets_per_image['labels']                                                               # N_boxes x 1   (class in range [1:20])
+            target_areas    = (target_boxes[:,2] - target_boxes[:,0]) * (target_boxes[:,3] - target_boxes[:,1])         # N_boxes x 1   (area)
+            target_centers  = (target_boxes[:,:2] + target_boxes[:,2:]) / 2                                             # N_boxes x 2   (x,y)
 
             for layer_points, layer_stride, layer_reg_range, layer_cls_logits, layer_reg_outputs, layer_ctr_logits in \
                 zip(points, strides, reg_range, cls_logits, reg_outputs, ctr_logits):
@@ -455,7 +455,8 @@ class FCOS(nn.Module):
                     (point_y >= subbox_y1) & 
                     (point_y <= subbox_y2) & 
                     (max_dist >= layer_reg_range[0]) & 
-                    (max_dist <= layer_reg_range[1]), True, False)
+                    (max_dist <= layer_reg_range[1]), 
+                    True, False)
                 
                 foreground_mask = torch.any(mask, dim=0)        # H x W   (True iff point lies inside any box)
                 background_mask = ~foreground_mask              # H x W   (True iff point doesn't lie in any box)
@@ -464,11 +465,12 @@ class FCOS(nn.Module):
                 N_foreground_points = foreground_mask.sum()
                 positive_samples += N_foreground_points
 
-                # for each foreground point, find the bounding box area
+                # for each foreground point, find the bounding box area,
                 # if point lies in multiple boxes, then multiple values 
-                # across N_boxes will be positive.
+                # across N_boxes will be positive. Select the one with
+                # least area.
                 area_per_point = mask * target_areas[:, None, None]             # N_boxes x H x W   (put box-area for foreground points)
-                area_per_point[~mask] = BIG_NUMBER                              # N_boxes x H x W   (put BIG_NUMBER for background points)#ASK this
+                area_per_point[~mask] = BIG_NUMBER                              # N_boxes x H x W   (put BIG_NUMBER for background points)
                 box_per_point = torch.min(area_per_point, dim=0)[1]             # H x W             (put box-index [0:N_boxes] of box with least area)
                 box_per_point[background_mask] = -1                             # H x W             (put -1 for background and [0:N_boxes] for foreground points)
 
@@ -477,6 +479,7 @@ class FCOS(nn.Module):
                 target_class_per_point = box_per_point.unsqueeze(dim=-1).repeat(1, 1, self.num_classes)             # H x W x N_classes
                 target_class_per_point[background_mask] = 0                                                         # background = zeroes
                 target_class_per_point[foreground_mask] = one_hot(label_per_point, num_classes=self.num_classes)    # foreground = one-hot
+                target_class_per_point.detach()
 
 
                 #####################
@@ -497,26 +500,25 @@ class FCOS(nn.Module):
                 #################
                 
                 # reg_outputs_per_point     : (H x W x 4)
-                predicted_l, predicted_t, predicted_r, predicted_b = reg_outputs_per_point[foreground_mask].T       # (N_foreground,)     (predicted distance for each point in foreground)
+                predicted_l, predicted_t, predicted_r, predicted_b = reg_outputs_per_point[foreground_mask].T        # (N_foreground,)     (predicted distance for each point in foreground)
                 #predicted_width  = (predicted_l + predicted_r) * layer_stride                                       # (N_foreground,)     (width of predicted box for each point in foreground)
                 #predicted_height = (predicted_t + predicted_b) * layer_stride                                       # (N_foreground,)     (height of predicted box for each point in foreground)
                 #WHY???
-                foreground_x, foreground_y = layer_points[foreground_mask].T  # (N_foreground, 2)
-                some1 = foreground_x - (predicted_l) * layer_stride
-                some2 = foreground_y - (predicted_t) * layer_stride    
-                some3 = foreground_x + (predicted_r) * layer_stride    
-                some4 = foreground_y + (predicted_b) * layer_stride 
-
-                predicted_xywh = torch.stack((some1, some2, some3, some4), dim=1)    # (N_foreground, 4)
-                #predicted_xyxy = box_convert(predicted_xywh, 'xywh', 'xyxy')                                            # (N_foreground, 4)
-                #Explain
-                target_xyxy = torch.zeros((*box_per_point.shape, 4), device=device)                                 # (H x W x 4)
+                foreground_x, foreground_y = layer_points[foreground_mask].T                                         # (N_foreground, 2)
+                predicted_x1 = foreground_x - (predicted_l) * layer_stride
+                predicted_y1 = foreground_y - (predicted_t) * layer_stride    
+                predicted_x2 = foreground_x + (predicted_r) * layer_stride    
+                predicted_y2 = foreground_y + (predicted_b) * layer_stride 
+                predicted_xyxy = torch.stack((predicted_x1, predicted_y1, predicted_x2, predicted_y2), dim=1)       # (N_foreground, 4)
+                
+                target_xyxy = torch.zeros((*box_per_point.shape, 4), device=device)                        # (H x W x 4)
                 target_xyxy[foreground_mask] = target_boxes[box_per_point[foreground_mask]]                         # (H x W x 4)
                 target_xyxy = target_xyxy[foreground_mask]                                                          # (N_foreground, 4)
+                target_xyxy.detach()
 
                 # predicted_xyxy    : (N_foreground, 4)
                 # target_xyxy       : (N_foreground, 4)
-                reg_loss += giou_loss(predicted_xywh, target_xyxy, reduction="sum")
+                reg_loss += giou_loss(predicted_xyxy, target_xyxy, reduction="sum")
 
 
                 #################
@@ -530,8 +532,8 @@ class FCOS(nn.Module):
                 # we can apply foreground mask of same starting dimensions (H x W)
                 # Note that in (H x W x N_boxes), each pixel contains l-values for all boxes
                 # Then we gather/select l-values of boxes corresponding to box-index specified in the index column vector
-                l_foreground = l.permute(1,2,0)[foreground_mask]                            # (N_foreground,)
-                l_foreground = l_foreground.gather(1, box_per_foreground_point)             # (N_foreground,) ??
+                l_foreground = l.permute(1,2,0)[foreground_mask]                            # (N_foreground, N_boxes)
+                l_foreground = l_foreground.gather(1, box_per_foreground_point)             # (N_foreground,)
 
                 # same for other distances
                 t_foreground = t.permute(1,2,0)[foreground_mask].gather(1, box_per_foreground_point)
@@ -548,7 +550,7 @@ class FCOS(nn.Module):
                 ctr_loss += binary_cross_entropy_with_logits(predicted_centerness, target_centerness)
 
 
-        print(cls_loss, reg_loss, ctr_loss)
+        # print(cls_loss, reg_loss, ctr_loss)
         
         positive_samples = max(1, positive_samples)
         cls_loss /= positive_samples
