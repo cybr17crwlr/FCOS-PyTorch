@@ -5,7 +5,10 @@ import torchvision
 from torchvision.models import resnet18, ResNet18_Weights
 from torchvision.models.feature_extraction import create_feature_extractor
 from torchvision.ops.feature_pyramid_network import FeaturePyramidNetwork
+from torchvision.ops import clip_boxes_to_image
 from torchvision.ops.boxes import batched_nms
+from torch.nn.functional import one_hot
+from torchvision.ops import box_convert
 
 import torch
 from torch import nn
@@ -201,6 +204,7 @@ class FCOS(nn.Module):
         img_std,
         train_cfg,
         test_cfg,
+        devices
     ):
         super().__init__()
         assert backbone == "ResNet18"
@@ -244,6 +248,8 @@ class FCOS(nn.Module):
         self.nms_thresh = test_cfg["nms_thresh"]
         self.detections_per_img = test_cfg["detections_per_img"]
         self.topk_candidates = test_cfg["topk_candidates"]
+
+        self.devices = devices
 
     """
     We will overwrite the train function. This allows us to always freeze
@@ -381,149 +387,324 @@ class FCOS(nn.Module):
     def compute_loss(
         self, targets, points, strides, reg_range, cls_logits, reg_outputs, ctr_logits
     ):
+        BIG_NUMBER = 1e8
 
-        global_cls_loss, global_reg_loss, global_ctr_loss = \
-            torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda")
+        device = self.devices[0]
 
-        nlayers = len(cls_logits)   # 3
-        for layer in range(nlayers):
-            cls_logits[layer]   = cls_logits[layer].permute((0,2,3,1))      # N x H x W x 20
-            reg_outputs[layer]  = reg_outputs[layer].permute((0,2,3,1))     # N x H x W x 4
-            ctr_logits[layer]   = ctr_logits[layer].permute((0,2,3,1))      # N x H x W x 1
+        positive_samples = 0
+        cls_loss, reg_loss, ctr_loss = torch.Tensor([0]).to(device), torch.Tensor([0]).to(device), torch.Tensor([0]).to(device)
 
-        # targets       -> [ Dict {
-        #                       boxes: tensor(nboxes x 4), 
-        #                       labels: tensor(nboxes), 
-        #                       image_id: tensor(1), 
-        #                       area: tensor(1), 
-        #                       iscrowd: ??
-        #                   }] x nimages
-        # 
-        # points        -> [ meshgrid(x, y) ] x nlayers
-        # strides       -> tensor(nlayers)
-        # reg_range     -> tensor(nlayers x 2)
-        # cls_logits    -> [ tensor( N x H x W x 20) ] x nlayers
-        # reg_outputs   -> [ tensor( N x H x W x 4) ] x nlayers
-        # ctr_logits    -> [ tensor( N x H x W x 1) ] x nlayers
+        for layer in range(len(cls_logits)):
+            cls_logits[layer]   = cls_logits[layer].permute((0,2,3,1))      # N_images x H x W x 20
+            reg_outputs[layer]  = reg_outputs[layer].permute((0,2,3,1))     # N_images x H x W x 4
+            ctr_logits[layer]   = ctr_logits[layer].permute((0,2,3,1))      # N_images x H x W x 1
 
-        # for every layer
-        for layer, (layer_stride, layer_points, layer_reg_range, layer_cls_logits, layer_reg_outputs, layer_ctr_logits) in \
-            enumerate(zip(strides, points, reg_range, cls_logits, reg_outputs, ctr_logits)):
-            # layer_stride      -> tensor(1)
-            # layer_points      -> tensor(H x W x 2)
-            # layer_reg_range   -> tensor(1 x 2)
-            # layer_cls_logits  -> tensor(N x H x W x 20)
-            # layer_reg_outputs -> tensor(N x H x W x 4)
-            # layer_ctr_logits  -> tensor(N x H x W x 1)
+        for image, targets_per_image in enumerate(targets):
+            target_boxes    = targets_per_image['boxes']                                                                # N_boxes x 4   (x1,y1,x2,y2)
+            target_label    = targets_per_image['labels']                                                               # N_boxes x 1   (class in range [1:20])
+            target_areas    = (target_boxes[:,2] - target_boxes[:,0]) * (target_boxes[:,3] - target_boxes[:,1])         # N_boxes x 1   (area)
+            target_centers  = (target_boxes[:,:2] + target_boxes[:,2:]) / 2                                             # N_boxes x 2   (x,y)
 
-            # for every image in that layer
-            for img, (img_cls_logits, img_reg_outputs, img_ctr_logits) in \
-                enumerate(zip(layer_cls_logits, layer_reg_outputs, layer_ctr_logits)):
-                # img_cls_logits    -> tensor(H x W x 20)
-                # img_reg_outputs   -> tensor(H x W x 4)
-                # img_ctr_logits    -> tensor(H x W x 1)
+            for layer_points, layer_stride, layer_reg_range, layer_cls_logits, layer_reg_outputs, layer_ctr_logits in \
+                zip(points, strides, reg_range, cls_logits, reg_outputs, ctr_logits):
+
+                cls_logits_per_point    = layer_cls_logits[image]       # H x W x 20
+                reg_outputs_per_point   = layer_reg_outputs[image]      # H x W x 4
+                ctr_logits_per_point    = layer_ctr_logits[image]       # H x W x 1
+
+                H, W = layer_points.shape[:2]       # layer_points - H x W x 2      (x,y)
+                N_boxes = target_boxes.shape[0]     # target_boxes - N_boxes x 4    (x1,y1,x2,y2)
+
+                center_boxes_x1y1 = target_centers - self.center_sampling_radius * layer_stride         # N_boxes x 2
+                center_boxes_x2y2 = target_centers + self.center_sampling_radius * layer_stride         # N_boxes x 2
+                target_center_boxes = torch.concat((center_boxes_x1y1, center_boxes_x2y2), dim = 1)     # N_boxes x 4
                 
-                positive_samples = 0
-                cls_loss, reg_loss, ctr_loss = torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda")
-                # for every point in that image
-                for point, point_cls_logit, point_reg_output, point_ctr_logit in \
-                    zip(layer_points.reshape(-1, 2), 
-                        img_cls_logits.reshape(-1, 20), 
-                        img_reg_outputs.reshape(-1, 4), 
-                        img_ctr_logits.reshape(-1, 1)):
+                repeated_layer_points = layer_points.unsqueeze(dim=0).repeat(N_boxes, 1, 1, 1)          # convert layer_points from H*W*2 to N_boxes*H*W*2
+                repeated_target_subboxes = target_center_boxes.view(-1, 1, 1, 4).repeat(1, H, W, 1)     # convert target_center_boxes from N_boxes*4 to N_boxes*H*W*4
 
-                        # point             -> tensor(2)
-                        # point_cls_logit   -> tensor(20)
-                        # point_reg_output  -> tensor(4)
-                        # point_ctr_logit   -> tensor(1)
-
-                        # find which target box contains this point
-                        # choose the one with least area in case of clash
-                        x, y = point
-                        
-                        target_box = None
-                        target_center = None
-                        target_label = None
-                        target_area = float('inf')
-                        
-                        # check if the reg_output lies within the reg_range
-                        if layer_reg_range[0] <= point_reg_output.max() <= layer_reg_range[1]:
-
-                            # search which box contains the point(x,y)
-                            for box, box_label, box_area in \
-                                zip(targets[img]['boxes'], targets[img]['labels'], targets[img]['area']):
-                                
-                                x1, y1, x2, y2 = box
-                                center_x = (x1 + x2) // 2
-                                center_y = (y1 + y2) // 2
-                                center_box_x1 = center_x - self.center_sampling_radius * layer_stride
-                                center_box_y1 = center_y - self.center_sampling_radius * layer_stride
-                                center_box_x2 = center_x + self.center_sampling_radius * layer_stride
-                                center_box_y2 = center_y + self.center_sampling_radius * layer_stride
-                                
-                                # check if point(x, y) lies within the target image's box
-                                if  center_box_x1 <= x <= center_box_x2 and \
-                                    center_box_y1 <= y <= center_box_y2 and \
-                                    box_area < target_area:
-                                    # save the box
-                                    target_box  = box
-                                    target_center = torch.Tensor([center_x, center_y, center_x, center_y]).to("cuda")
-                                    positive_samples += 1
-                                    target_label = box_label.item() - 1     # convert to 0-indexed
-                                    target_area = box_area.item()
-                                
-                        # ###################
-                        # classification loss
-                        #   - points inside the sub-box are classified using one-hot encoding
-                        #   - points outside the sub-box are considered to be background
-                        # ###################
-                        target_cls_logit = torch.zeros_like(point_cls_logit)    # tensor(20)
-                        if target_label is not None:
-                            target_cls_logit[target_label] = 1.0
-                        
-                        cls_loss += sigmoid_focal_loss(point_cls_logit, target_cls_logit, reduction="sum")
-                        
-
-                        # ###################
-                        # regression loss & center-ness loss
-                        #   - points inside the target-box are regressed
-                        #   - points outside the target-box are ignored
-                        # ###################
-                        if target_label is not None:
-                            x1, y1, x2, y2 = target_box
-                            
-                            # reverse map to get predicted x1, y1, x2, y2
-                            pred_l, pred_t, pred_r, pred_b = point_reg_output
-                            # pred_x1 = x1 - pred_l * layer_stride
-                            # pred_y1 = y1 - pred_t * layer_stride
-                            # pred_x2 = x2 + pred_r * layer_stride
-                            # pred_y2 = y2 + pred_b * layer_stride
-                            reg_loss += giou_loss(target_center + (point_reg_output * layer_stride * torch.Tensor([-1,-1,1,1]).to('cuda')), target_box, reduction="sum")
-
-                            #reg_loss += giou_loss(pred_box, target_box, reduction="sum")
-
-                            # center-ness
-                            # TODO: check this: sometimes one of pred l, r, t, b values are 0
-                            if pred_l.item() > 0 and pred_t.item() > 0 and pred_r.item() > 0 and pred_b.item() > 0:
-                                pred_ctr =  torch.min(pred_l, pred_r) * torch.min(pred_t, pred_b)
-                                pred_ctr /= torch.max(pred_l, pred_r) * torch.max(pred_t, pred_b)
-                                pred_ctr = torch.sqrt(pred_ctr).reshape(1)
-                                ctr_loss += binary_cross_entropy_with_logits(point_ctr_logit, pred_ctr)
+                point_x = repeated_layer_points[:,:,:,0]            # N_boxes x H x W
+                point_y = repeated_layer_points[:,:,:,1]            # N_boxes x H x W
                 
-                # get the final loss for this image
-                # TODO: check this: verify against Eq 2
-                positive_samples = max(positive_samples, 1)
-                global_cls_loss += (cls_loss / positive_samples)
-                global_reg_loss += (reg_loss / positive_samples)
-                global_ctr_loss += (ctr_loss/ positive_samples)
-                            
-        # print(cls_loss, reg_loss, ctr_loss, final_loss)
+                subbox_x1 = repeated_target_subboxes[:,:,:,0]       # N_boxes x H x W
+                subbox_y1 = repeated_target_subboxes[:,:,:,1]       # N_boxes x H x W
+                subbox_x2 = repeated_target_subboxes[:,:,:,2]       # N_boxes x H x W
+                subbox_y2 = repeated_target_subboxes[:,:,:,3]       # N_boxes x H x W
+
+                l = (point_x - subbox_x1) / layer_stride            # N_boxes x H x W
+                t = (point_y - subbox_y1) / layer_stride            # N_boxes x H x W
+                r = (subbox_x2 - point_x) / layer_stride            # N_boxes x H x W
+                b = (subbox_y2 - point_y) / layer_stride            # N_boxes x H x W
+                
+                # add extra dimension at the end so that concat on last dim returns tensor of shape (N_boxes x H x W x 4)
+                #why ??
+                ll = l.unsqueeze(-1)                                 # N_boxes x H x W x 1
+                tt = t.unsqueeze(-1)                                 # N_boxes x H x W x 1
+                rr = r.unsqueeze(-1)                                 # N_boxes x H x W x 1
+                bb = b.unsqueeze(-1)                                 # N_boxes x H x W x 1
+
+                max_dist = torch.max(torch.cat((ll, tt, rr, bb), dim=-1), dim=-1)[0]   # N_boxes x H x W
+
+                # each point must satisfy below conditions:
+                # 1. point (x,y) must be within target subbox
+                # 2. point (x,y) must be within target box      (required as some certain edge-cases lie within target subbox but outside target box)
+                # 3. max(l,t,r,b) for that point must be within layer_reg_range
+
+                mask = torch.where(                     # N_boxes x H x W   (True/False)
+                    (point_x >= subbox_x1) & 
+                    (point_x <= subbox_x2) &
+                    (point_y >= subbox_y1) & 
+                    (point_y <= subbox_y2) & 
+                    (max_dist >= layer_reg_range[0]) & 
+                    (max_dist <= layer_reg_range[1]), 
+                    True, False)
+                
+                foreground_mask = torch.any(mask, dim=0)        # H x W   (True iff point lies inside any box)
+                background_mask = ~foreground_mask              # H x W   (True iff point doesn't lie in any box)
+                
+                # update positive samples
+                N_foreground_points = foreground_mask.sum()
+                positive_samples += N_foreground_points
+
+                # for each foreground point, find the bounding box area,
+                # if point lies in multiple boxes, then multiple values 
+                # across N_boxes will be positive. Select the one with
+                # least area.
+                area_per_point = mask * target_areas[:, None, None]             # N_boxes x H x W   (put box-area for foreground points)
+                area_per_point[~mask] = BIG_NUMBER                              # N_boxes x H x W   (put BIG_NUMBER for background points)
+                box_per_point = torch.min(area_per_point, dim=0)[1]             # H x W             (put box-index [0:N_boxes] of box with least area)
+                box_per_point[background_mask] = -1                             # H x W             (put -1 for background and [0:N_boxes] for foreground points)
+
+                label_per_point = target_label[box_per_point[foreground_mask]]  # 1 x N_foreground_points
+
+                target_class_per_point = box_per_point.unsqueeze(dim=-1).repeat(1, 1, self.num_classes)             # H x W x N_classes
+                target_class_per_point[background_mask] = 0                                                         # background = zeroes
+                target_class_per_point[foreground_mask] = one_hot(label_per_point, num_classes=self.num_classes)    # foreground = one-hot
+                target_class_per_point.detach()
+
+
+                #####################
+                # Classification Loss
+                #####################
+
+                # cls_logits_per_point      : (H x W x 20)
+                # target_class_per_point    : (H x W x 20)
+                cls_loss += sigmoid_focal_loss(cls_logits_per_point, target_class_per_point, reduction="sum")
+
+
+                if N_foreground_points == 0:
+                    # skip regression and centerness loss if no foreground points found
+                    continue
+
+                #################
+                # Regression Loss
+                #################
+                
+                # reg_outputs_per_point     : (H x W x 4)
+                predicted_l, predicted_t, predicted_r, predicted_b = reg_outputs_per_point[foreground_mask].T        # (N_foreground,)     (predicted distance for each point in foreground)
+                #predicted_width  = (predicted_l + predicted_r) * layer_stride                                       # (N_foreground,)     (width of predicted box for each point in foreground)
+                #predicted_height = (predicted_t + predicted_b) * layer_stride                                       # (N_foreground,)     (height of predicted box for each point in foreground)
+                #WHY???
+                foreground_x, foreground_y = layer_points[foreground_mask].T                                         # (N_foreground, 2)
+                predicted_x1 = foreground_x - (predicted_l) * layer_stride
+                predicted_y1 = foreground_y - (predicted_t) * layer_stride    
+                predicted_x2 = foreground_x + (predicted_r) * layer_stride    
+                predicted_y2 = foreground_y + (predicted_b) * layer_stride 
+                predicted_xyxy = torch.stack((predicted_x1, predicted_y1, predicted_x2, predicted_y2), dim=1)       # (N_foreground, 4)
+                
+                target_xyxy = torch.zeros((*box_per_point.shape, 4), device=device)                        # (H x W x 4)
+                target_xyxy[foreground_mask] = target_boxes[box_per_point[foreground_mask]]                         # (H x W x 4)
+                target_xyxy = target_xyxy[foreground_mask]                                                          # (N_foreground, 4)
+                target_xyxy.detach()
+
+                # predicted_xyxy    : (N_foreground, 4)
+                # target_xyxy       : (N_foreground, 4)
+                reg_loss += giou_loss(predicted_xyxy, target_xyxy, reduction="sum")
+
+
+                #################
+                # Centerness Loss
+                #################
+
+                # column vector that specifies the box-index of each foreground point
+                box_per_foreground_point = box_per_point[foreground_mask].view(-1, 1)       # (N_foreground,)
+                
+                # permute l from (N_boxes x H x W) to (H x W x N_boxes) so that 
+                # we can apply foreground mask of same starting dimensions (H x W)
+                # Note that in (H x W x N_boxes), each pixel contains l-values for all boxes
+                # Then we gather/select l-values of boxes corresponding to box-index specified in the index column vector
+                l_foreground = l.permute(1,2,0)[foreground_mask]                            # (N_foreground, N_boxes)
+                l_foreground = l_foreground.gather(1, box_per_foreground_point)             # (N_foreground,)
+
+                # same for other distances
+                t_foreground = t.permute(1,2,0)[foreground_mask].gather(1, box_per_foreground_point)
+                r_foreground = r.permute(1,2,0)[foreground_mask].gather(1, box_per_foreground_point)
+                b_foreground = b.permute(1,2,0)[foreground_mask].gather(1, box_per_foreground_point)
+                
+                target_centerness =  torch.sqrt(                                                            # (N_foreground,)
+                    (torch.min(l_foreground, r_foreground) * torch.min(t_foreground, b_foreground)) / 
+                    (torch.max(l_foreground, r_foreground) * torch.max(t_foreground, b_foreground))
+                ).detach()
+
+                # ctr_logits_per_point : (H x W x 1)
+                predicted_centerness = ctr_logits_per_point[foreground_mask]                    # (N_foreground,1)
+                ctr_loss += binary_cross_entropy_with_logits(predicted_centerness, target_centerness)
+
+
+        # print(cls_loss, reg_loss, ctr_loss)
+        
+        positive_samples = max(1, positive_samples)
+        cls_loss /= positive_samples
+        reg_loss /= positive_samples
+        ctr_loss /= positive_samples
+        final_loss = cls_loss + reg_loss + ctr_loss
+
         return {
-            'cls_loss'  : global_cls_loss,
-            'reg_loss'  : global_reg_loss,
-            'ctr_loss'  : global_ctr_loss,
-            'final_loss': global_cls_loss + global_reg_loss + global_ctr_loss
+            'cls_loss'  : cls_loss,
+            'reg_loss'  : reg_loss,
+            'ctr_loss'  : ctr_loss,
+            'final_loss': final_loss
         }
+            
+        # positive_samples = 0
+        # cls_loss, reg_loss, ctr_loss = torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda"), torch.Tensor([0]).to("cuda")
+
+        # nlayers = len(cls_logits)   # 3
+        # for layer in range(nlayers):
+        #     cls_logits[layer]   = cls_logits[layer].permute((0,2,3,1))      # N x H x W x 20
+        #     reg_outputs[layer]  = reg_outputs[layer].permute((0,2,3,1))     # N x H x W x 4
+        #     ctr_logits[layer]   = ctr_logits[layer].permute((0,2,3,1))      # N x H x W x 1
+
+        # # targets       -> [ Dict {
+        # #                       boxes: tensor(nboxes x 4), 
+        # #                       labels: tensor(nboxes), 
+        # #                       image_id: tensor(1), 
+        # #                       area: tensor(1), 
+        # #                       iscrowd: ??
+        # #                   }] x nimages
+        # # 
+        # # points        -> [ meshgrid(x, y) ] x nlayers
+        # # strides       -> tensor(nlayers)
+        # # reg_range     -> tensor(nlayers x 2)
+        # # cls_logits    -> [ tensor( N x H x W x 20) ] x nlayers
+        # # reg_outputs   -> [ tensor( N x H x W x 4) ] x nlayers
+        # # ctr_logits    -> [ tensor( N x H x W x 1) ] x nlayers
+
+        # # for every layer
+        # for layer, (layer_stride, layer_points, layer_reg_range, layer_cls_logits, layer_reg_outputs, layer_ctr_logits) in \
+        #     enumerate(zip(strides, points, reg_range, cls_logits, reg_outputs, ctr_logits)):
+        #     # layer_stride      -> tensor(1)
+        #     # layer_points      -> tensor(H x W x 2)
+        #     # layer_reg_range   -> tensor(1 x 2)
+        #     # layer_cls_logits  -> tensor(N x H x W x 20)
+        #     # layer_reg_outputs -> tensor(N x H x W x 4)
+        #     # layer_ctr_logits  -> tensor(N x H x W x 1)
+
+        #     # for every image in that layer
+        #     for img, (img_cls_logits, img_reg_outputs, img_ctr_logits) in \
+        #         enumerate(zip(layer_cls_logits, layer_reg_outputs, layer_ctr_logits)):
+        #         # img_cls_logits    -> tensor(H x W x 20)
+        #         # img_reg_outputs   -> tensor(H x W x 4)
+        #         # img_ctr_logits    -> tensor(H x W x 1)
+                
+                
+        #         # for every point in that image
+        #         for point, point_cls_logit, point_reg_output, point_ctr_logit in \
+        #             zip(layer_points.reshape(-1, 2), 
+        #                 img_cls_logits.reshape(-1, 20), 
+        #                 img_reg_outputs.reshape(-1, 4), 
+        #                 img_ctr_logits.reshape(-1, 1)):
+
+        #                 # point             -> tensor(2)
+        #                 # point_cls_logit   -> tensor(20)
+        #                 # point_reg_output  -> tensor(4)
+        #                 # point_ctr_logit   -> tensor(1)
+
+        #                 # find which target box contains this point
+        #                 # choose the one with least area in case of clash
+        #                 x, y = point
+                        
+        #                 target_box = None
+        #                 target_center = None
+        #                 target_label = None
+        #                 target_area = float('inf')
+        #                 target_box_ll = None
+        #                 target_box_tt = None
+        #                 target_box_rr = None
+        #                 target_box_bb = None
+
+        #                 # search which box contains the point(x,y)
+        #                 for box, box_label, box_area in \
+        #                     zip(targets[img]['boxes'], targets[img]['labels'], targets[img]['area']):
+
+        #                     x1, y1, x2, y2 = box
+        #                     center_x = (x1 + x2) / 2
+        #                     center_y = (y1 + y2) / 2
+        #                     center_box = torch.Tensor([center_x, center_y, center_x, center_y]).to('cuda') + (self.center_sampling_radius * layer_stride * torch.Tensor([-1,-1,1,1]).to('cuda'))
+        #                     center_box.detach()
+
+        #                     ll = (center_x - x1) / layer_stride
+        #                     tt = (center_y - y1) / layer_stride
+        #                     rr = (x2 - center_x) / layer_stride
+        #                     bb = (y2 - center_y) / layer_stride
+        #                     ll.detach()
+        #                     tt.detach()
+        #                     rr.detach()
+        #                     bb.detach()
+                            
+        #                     # check if the reg_output lies within the reg_range
+        #                     if layer_reg_range[0] <= max(ll, tt, rr, bb) <= layer_reg_range[1]:
+                            
+        #                         # check if point(x, y) lies within the target image's center box
+        #                         if  center_box[0] <= x <= center_box[2] and \
+        #                             center_box[1] <= y <= center_box[3] and \
+        #                             box_area < target_area:
+        #                             # save the box
+        #                             target_box  = box
+        #                             target_center = torch.Tensor([center_x, center_y, center_x, center_y]).to("cuda").detach()
+        #                             positive_samples += 1
+        #                             target_label = box_label.item() - 1     # convert to 0-indexed
+        #                             target_area = box_area.item()
+        #                             target_box_ll = ll
+        #                             target_box_tt = tt
+        #                             target_box_rr = rr
+        #                             target_box_bb = bb
+                                
+        #                 # ###################
+        #                 # classification loss
+        #                 #   - points inside the sub-box are classified using one-hot encoding
+        #                 #   - points outside the sub-box are considered to be background
+        #                 # ###################
+        #                 target_cls_logit = torch.zeros_like(point_cls_logit)    # tensor(20)
+        #                 if target_label is not None:
+        #                     target_cls_logit[target_label] = 1.0
+                        
+        #                 cls_loss += sigmoid_focal_loss(point_cls_logit, target_cls_logit, reduction="sum")
+                        
+
+        #                 # ###################
+        #                 # regression loss & center-ness loss
+        #                 #   - points inside the target-box are regressed
+        #                 #   - points outside the target-box are ignored
+        #                 # ###################
+        #                 if target_label is not None:
+        #                     x1, y1, x2, y2 = target_box
+                            
+        #                     reg_loss += giou_loss(target_center + (point_reg_output * layer_stride * torch.Tensor([-1,-1,1,1]).to('cuda')), target_box, reduction="sum")
+
+        #                     # center-ness
+        #                     # TODO: check this: sometimes one of pred l, r, t, b values are 0
+        #                     pred_ctr =  torch.min(target_box_ll, target_box_rr) * torch.min(target_box_tt, target_box_bb)
+        #                     pred_ctr /=  torch.max(target_box_ll, target_box_rr) * torch.max(target_box_tt, target_box_bb)
+        #                     pred_ctr = torch.sqrt(pred_ctr).reshape(1).detach()
+        #                     ctr_loss += binary_cross_entropy_with_logits(point_ctr_logit, pred_ctr)
+
+        # positive_samples = max(positive_samples,1)
+        # return {
+        #     'cls_loss'  : cls_loss/positive_samples,
+        #     'reg_loss'  : reg_loss/positive_samples,
+        #     'ctr_loss'  : ctr_loss/positive_samples,
+        #     'final_loss': (cls_loss + reg_loss + ctr_loss)/positive_samples
+        # }
 
     """
     Fill in the missing code here. The inference is also a bit involved. It is
@@ -561,4 +742,67 @@ class FCOS(nn.Module):
     def inference(
         self, points, strides, cls_logits, reg_outputs, ctr_logits, image_shapes
     ):
+        detections = []
+        num_of_images = len(image_shapes)
+        #TODO Can image be matricied
+        for index in range(num_of_images):
+            boxes = []
+            scores = []
+            labels = []
+            combination = []
+            for layer_stride, box_regression_per_image_per_level, logits_per_image_per_level, box_ctrness_image_per_level, points_per_level in zip(strides, reg_outputs, cls_logits, ctr_logits, points):
+               
+                box_regression_per_image = box_regression_per_image_per_level[index]
+                logits_per_image = logits_per_image_per_level[index]
+                box_ctrness_per_image = box_ctrness_image_per_level[index]
+           
+                scores_per_level = torch.sqrt(
+                torch.sigmoid(logits_per_image) * torch.sigmoid(box_ctrness_per_image)).flatten()
+                print(scores_per_level.shape)
+               
+                keep_idxs = scores_per_level > self.score_thresh
+                scores_per_level = scores_per_level
+                topk_idxs = torch.where(keep_idxs)[0] ##INDEXES
+               
+                #TODO: Decode all boxes , then filtering ( reverse this )
+                pred_l, pred_t, pred_r, pred_b = box_regression_per_image
+                centerx = points_per_level[:,:,0]
+                centery = points_per_level[:,:,1]
+                x1 = centerx - pred_l * layer_stride 
+                y1 = centery - pred_b * layer_stride
+                x2 = centerx + pred_r * layer_stride 
+                y2 = centery + pred_t * layer_stride
+                boxes_per_level = clip_boxes_to_image(torch.stack([x1,y1,x2,y2]).permute(1,2,0) , image_shapes[index]).reshape(-1,4)
+                box_idxs = torch.div(topk_idxs, 20, rounding_mode="floor")
+               
+                scores.append(scores_per_level[keep_idxs])
+                boxes.append(boxes_per_level[box_idxs])
+                labels.append(topk_idxs%20)
+             
+            scores = torch.cat(scores, dim=0)
+            boxes = torch.cat(boxes, dim=0)
+            labels = torch.cat(labels, dim=0)  
+           
+            if(self.topk_candidates > scores.shape[0]):
+                detections.append(
+                    {
+                        "boxes": boxes,
+                        "scores": scores, #TODO shd we sort ??
+                        "labels": labels,
+                    }
+                )
+            else:
+                sorted_scores = torch.argsort(scores, descending=True)
+                boxes = boxes[sorted_scores][:self.topk_candidates]   #This works like pipe ??
+                scores = scores[sorted_scores][:self.topk_candidates]  
+                labels = labels[sorted_scores][:self.topk_candidates]  
+               
+                detections.append(
+                    {
+                        "boxes": boxes,
+                        "scores": scores,
+                        "labels": labels,
+                    }
+                )
+           
         return detections
