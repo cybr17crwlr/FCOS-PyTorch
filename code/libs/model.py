@@ -402,7 +402,7 @@ class FCOS(nn.Module):
 
         for image, targets_per_image in enumerate(targets):
             target_boxes    = targets_per_image['boxes']                                                                # N_boxes x 4   (x1,y1,x2,y2)
-            target_label    = targets_per_image['labels']                                                               # N_boxes x 1   (class in range [1:20])
+            target_label    = targets_per_image['labels']                                                               # N_boxes x 1   (class in range [0:19])
             target_areas    = (target_boxes[:,2] - target_boxes[:,0]) * (target_boxes[:,3] - target_boxes[:,1])         # N_boxes x 1   (area)
             target_centers  = (target_boxes[:,:2] + target_boxes[:,2:]) / 2                                             # N_boxes x 2   (x,y)
 
@@ -413,7 +413,7 @@ class FCOS(nn.Module):
                 reg_outputs_per_point   = layer_reg_outputs[image]      # H x W x 4
                 ctr_logits_per_point    = layer_ctr_logits[image]       # H x W x 1
 
-                W, H = layer_points.shape[:2]       # layer_points - H x W x 2      (x,y)
+                H, W = layer_points.shape[:2]       # layer_points - H x W x 2      (x,y)
                 N_boxes = target_boxes.shape[0]     # target_boxes - N_boxes x 4    (x1,y1,x2,y2)
 
                 center_boxes_x1y1 = target_centers - self.center_sampling_radius * layer_stride         # N_boxes x 2
@@ -421,17 +421,17 @@ class FCOS(nn.Module):
                 target_center_boxes = torch.concat((center_boxes_x1y1, center_boxes_x2y2), dim = 1)     # N_boxes x 4
                 
                 repeated_layer_points = layer_points.unsqueeze(dim=0).repeat(N_boxes, 1, 1, 1)          # convert layer_points from H*W*2 to N_boxes*H*W*2
-                repeated_target_subboxes = target_center_boxes.view(-1, 1, 1, 4).repeat(1, W, H, 1)     # convert target_center_boxes from N_boxes*4 to N_boxes*H*W*4
+                repeated_target_subboxes = target_center_boxes.view(-1, 1, 1, 4).repeat(1, H, W, 1)     # convert target_center_boxes from N_boxes*4 to N_boxes*H*W*4
 
-                point_x = repeated_layer_points[:,:,:,0]            # N_boxes x H x W
-                point_y = repeated_layer_points[:,:,:,1]            # N_boxes x H x W
+                point_y = repeated_layer_points[:,:,:,0]            # N_boxes x H x W
+                point_x = repeated_layer_points[:,:,:,1]            # N_boxes x H x W
                 
                 subbox_x1 = repeated_target_subboxes[:,:,:,0]       # N_boxes x H x W
                 subbox_y1 = repeated_target_subboxes[:,:,:,1]       # N_boxes x H x W
                 subbox_x2 = repeated_target_subboxes[:,:,:,2]       # N_boxes x H x W
                 subbox_y2 = repeated_target_subboxes[:,:,:,3]       # N_boxes x H x W
                 
-                repeated_target_boxes = target_boxes.view(-1, 1, 1, 4).repeat(1, W, H, 1)  
+                repeated_target_boxes = target_boxes.view(-1, 1, 1, 4).repeat(1, H, W, 1)  
                 target_box_x1 = repeated_target_boxes[:,:,:,0]       # N_boxes x H x W
                 target_box_y1 = repeated_target_boxes[:,:,:,1]       # N_boxes x H x W
                 target_box_x2 = repeated_target_boxes[:,:,:,2]       # N_boxes x H x W
@@ -520,8 +520,8 @@ class FCOS(nn.Module):
                 predicted_r = reg_outputs_per_point[foreground_mask][:,2]
                 predicted_b = reg_outputs_per_point[foreground_mask][:,3]
                 
-                foreground_x = layer_points[foreground_mask][:,0]
-                foreground_y = layer_points[foreground_mask][:,1]
+                foreground_y = layer_points[foreground_mask][:,0]
+                foreground_x = layer_points[foreground_mask][:,1]
                 
                 predicted_x1 = foreground_x - (predicted_l) * layer_stride
                 predicted_y1 = foreground_y - (predicted_t) * layer_stride    
@@ -529,7 +529,7 @@ class FCOS(nn.Module):
                 predicted_y2 = foreground_y + (predicted_b) * layer_stride 
                 predicted_xyxy = torch.stack((predicted_x1, predicted_y1, predicted_x2, predicted_y2), dim=1)       # (N_foreground, 4)
                 
-                target_xyxy = torch.zeros((*box_per_point.shape, 4), device=device)                        # (H x W x 4)
+                target_xyxy = torch.zeros((*box_per_point.shape, 4), device=device)                                 # (H x W x 4)
                 target_xyxy[foreground_mask] = target_boxes[box_per_point[foreground_mask]]                         # (H x W x 4)
                 target_xyxy = target_xyxy[foreground_mask]                                                          # (N_foreground, 4)
                 target_xyxy.detach()
