@@ -565,7 +565,7 @@ class FCOS(nn.Module):
 
                 # ctr_logits_per_point : (H x W x 1)
                 predicted_centerness = ctr_logits_per_point[foreground_mask]                    # (N_foreground,1)
-                ctr_loss.append(binary_cross_entropy_with_logits(predicted_centerness, target_centerness))
+                ctr_loss.append(binary_cross_entropy_with_logits(predicted_centerness, target_centerness, reduction="sum"))
 
 
         # print(cls_loss, reg_loss, ctr_loss)
