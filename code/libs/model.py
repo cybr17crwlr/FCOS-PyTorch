@@ -786,8 +786,8 @@ class FCOS(nn.Module):
                
                 #TODO: Decode all boxes , then filtering ( reverse this )
                 pred_l, pred_t, pred_r, pred_b = box_regression_per_image
-                centerx = points_per_level[:,:,0]
-                centery = points_per_level[:,:,1]
+                centerx = points_per_level[:,:,1]
+                centery = points_per_level[:,:,0]
                 x1 = centerx - pred_l * layer_stride 
                 y1 = centery - pred_b * layer_stride
                 x2 = centerx + pred_r * layer_stride 
