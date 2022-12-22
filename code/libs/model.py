@@ -392,8 +392,9 @@ class FCOS(nn.Module):
         device = self.devices[0]
 
         positive_samples = 0
-        cls_loss, reg_loss, ctr_loss = torch.Tensor([0]).to(device), torch.Tensor([0]).to(device), torch.Tensor([0]).to(device)
-
+        
+        cls_loss, reg_loss, ctr_loss = [], [], []
+        
         for layer in range(len(cls_logits)):
             cls_logits[layer]   = cls_logits[layer].permute((0,2,3,1))      # N_images x H x W x 20
             reg_outputs[layer]  = reg_outputs[layer].permute((0,2,3,1))     # N_images x H x W x 4
@@ -412,7 +413,7 @@ class FCOS(nn.Module):
                 reg_outputs_per_point   = layer_reg_outputs[image]      # H x W x 4
                 ctr_logits_per_point    = layer_ctr_logits[image]       # H x W x 1
 
-                H, W = layer_points.shape[:2]       # layer_points - H x W x 2      (x,y)
+                W, H = layer_points.shape[:2]       # layer_points - H x W x 2      (x,y)
                 N_boxes = target_boxes.shape[0]     # target_boxes - N_boxes x 4    (x1,y1,x2,y2)
 
                 center_boxes_x1y1 = target_centers - self.center_sampling_radius * layer_stride         # N_boxes x 2
@@ -420,7 +421,7 @@ class FCOS(nn.Module):
                 target_center_boxes = torch.concat((center_boxes_x1y1, center_boxes_x2y2), dim = 1)     # N_boxes x 4
                 
                 repeated_layer_points = layer_points.unsqueeze(dim=0).repeat(N_boxes, 1, 1, 1)          # convert layer_points from H*W*2 to N_boxes*H*W*2
-                repeated_target_subboxes = target_center_boxes.view(-1, 1, 1, 4).repeat(1, H, W, 1)     # convert target_center_boxes from N_boxes*4 to N_boxes*H*W*4
+                repeated_target_subboxes = target_center_boxes.view(-1, 1, 1, 4).repeat(1, W, H, 1)     # convert target_center_boxes from N_boxes*4 to N_boxes*H*W*4
 
                 point_x = repeated_layer_points[:,:,:,0]            # N_boxes x H x W
                 point_y = repeated_layer_points[:,:,:,1]            # N_boxes x H x W
@@ -430,7 +431,7 @@ class FCOS(nn.Module):
                 subbox_x2 = repeated_target_subboxes[:,:,:,2]       # N_boxes x H x W
                 subbox_y2 = repeated_target_subboxes[:,:,:,3]       # N_boxes x H x W
                 
-                repeated_target_boxes = target_boxes.view(-1, 1, 1, 4).repeat(1, H, W, 1)  
+                repeated_target_boxes = target_boxes.view(-1, 1, 1, 4).repeat(1, W, H, 1)  
                 target_box_x1 = repeated_target_boxes[:,:,:,0]       # N_boxes x H x W
                 target_box_y1 = repeated_target_boxes[:,:,:,1]       # N_boxes x H x W
                 target_box_x2 = repeated_target_boxes[:,:,:,2]       # N_boxes x H x W
@@ -456,14 +457,19 @@ class FCOS(nn.Module):
                 # 3. max(l,t,r,b) for that point must be within layer_reg_range
 
                 mask = torch.where(                     # N_boxes x H x W   (True/False)
+                    # point lies in target-subbox
                     (point_x >= subbox_x1) & 
                     (point_x <= subbox_x2) &
                     (point_y >= subbox_y1) & 
                     (point_y <= subbox_y2) & 
+
+                    # point lies in target-box
                     (point_x >= target_box_x1) & 
                     (point_x <= target_box_x2) &
                     (point_y >= target_box_y1) & 
                     (point_y <= target_box_y2) & 
+
+                    # max distance lies within regression range
                     (max_dist >= layer_reg_range[0]) & 
                     (max_dist <= layer_reg_range[1]), 
                     True, False)
@@ -472,7 +478,7 @@ class FCOS(nn.Module):
                 background_mask = ~foreground_mask              # H x W   (True iff point doesn't lie in any box)
                 
                 # update positive samples
-                N_foreground_points = foreground_mask.sum()
+                N_foreground_points = foreground_mask.sum().detach()
                 positive_samples += N_foreground_points
 
                 # for each foreground point, find the bounding box area,
@@ -498,8 +504,7 @@ class FCOS(nn.Module):
 
                 # cls_logits_per_point      : (H x W x 20)
                 # target_class_per_point    : (H x W x 20)
-                cls_loss += sigmoid_focal_loss(cls_logits_per_point, target_class_per_point, reduction="sum")
-
+                cls_loss.append(sigmoid_focal_loss(cls_logits_per_point, target_class_per_point, reduction="sum"))
 
                 if N_foreground_points == 0:
                     # skip regression and centerness loss if no foreground points found
@@ -510,11 +515,14 @@ class FCOS(nn.Module):
                 #################
                 
                 # reg_outputs_per_point     : (H x W x 4)
-                predicted_l, predicted_t, predicted_r, predicted_b = reg_outputs_per_point[foreground_mask].T        # (N_foreground,)     (predicted distance for each point in foreground)
-                #predicted_width  = (predicted_l + predicted_r) * layer_stride                                       # (N_foreground,)     (width of predicted box for each point in foreground)
-                #predicted_height = (predicted_t + predicted_b) * layer_stride                                       # (N_foreground,)     (height of predicted box for each point in foreground)
-                #WHY???
-                foreground_x, foreground_y = layer_points[foreground_mask].T                                         # (N_foreground, 2)
+                predicted_l = reg_outputs_per_point[foreground_mask][:,0]       # (N_foreground,)     (predicted distance for each point in foreground)
+                predicted_t = reg_outputs_per_point[foreground_mask][:,1]
+                predicted_r = reg_outputs_per_point[foreground_mask][:,2]
+                predicted_b = reg_outputs_per_point[foreground_mask][:,3]
+                
+                foreground_x = layer_points[foreground_mask][:,0]
+                foreground_y = layer_points[foreground_mask][:,1]
+                
                 predicted_x1 = foreground_x - (predicted_l) * layer_stride
                 predicted_y1 = foreground_y - (predicted_t) * layer_stride    
                 predicted_x2 = foreground_x + (predicted_r) * layer_stride    
@@ -528,7 +536,7 @@ class FCOS(nn.Module):
 
                 # predicted_xyxy    : (N_foreground, 4)
                 # target_xyxy       : (N_foreground, 4)
-                reg_loss += giou_loss(predicted_xyxy, target_xyxy, reduction="sum")
+                reg_loss.append(giou_loss(predicted_xyxy, target_xyxy, reduction="sum"))
 
 
                 #################
@@ -557,21 +565,23 @@ class FCOS(nn.Module):
 
                 # ctr_logits_per_point : (H x W x 1)
                 predicted_centerness = ctr_logits_per_point[foreground_mask]                    # (N_foreground,1)
-                ctr_loss += binary_cross_entropy_with_logits(predicted_centerness, target_centerness)
+                ctr_loss.append(binary_cross_entropy_with_logits(predicted_centerness, target_centerness))
 
 
         # print(cls_loss, reg_loss, ctr_loss)
         
         positive_samples = max(1, positive_samples)
-        cls_loss /= positive_samples
-        reg_loss /= positive_samples
-        ctr_loss /= positive_samples
-        final_loss = cls_loss + reg_loss + ctr_loss
+
+        # torch.stack(cls_loss) - N x H x W
+        total_cls_loss = torch.sum(sum(cls_loss)) / positive_samples   # scalar
+        total_reg_loss = torch.sum(sum(reg_loss)) / positive_samples   # scalar
+        total_ctr_loss = torch.sum(sum(ctr_loss)) / positive_samples   # scalar
+        final_loss = total_cls_loss + total_reg_loss + total_ctr_loss
 
         return {
-            'cls_loss'  : cls_loss,
-            'reg_loss'  : reg_loss,
-            'ctr_loss'  : ctr_loss,
+            'cls_loss'  : total_cls_loss,
+            'reg_loss'  : total_reg_loss,
+            'ctr_loss'  : total_ctr_loss,
             'final_loss': final_loss
         }
             
