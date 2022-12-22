@@ -787,7 +787,7 @@ class FCOS(nn.Module):
                
                 scores.append(scores_per_level[keep_idxs])
                 boxes.append(boxes_per_level[box_idxs])
-                labels.append(topk_idxs%20)
+                labels.append(topk_idxs%20 + 1) #OFFSET append
              
             scores = torch.cat(scores, dim=0)
             boxes = torch.cat(boxes, dim=0)
