@@ -10,7 +10,7 @@
             "request": "launch",
             "cwd": "${workspaceFolder}/code",
             "program": "train.py",
-            "args": ["configs/voc_fcos.yaml"],
+            "args": ["configs/voc_fcos.yaml","--print-freq=10", "--ckpt-freq=1"],
             "console": "integratedTerminal",
             "justMyCode": true
         }

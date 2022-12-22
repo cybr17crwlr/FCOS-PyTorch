@@ -53,7 +53,7 @@ def main(args):
 
     """3. create model"""
     # model
-    model = FCOS(**cfg["model"]).to(torch.device(cfg["devices"][0]))
+    model = FCOS(**cfg["model"], devices=cfg["devices"]).to(torch.device(cfg["devices"][0]))
     # also disable cudnn benchmark, as the input size varies during inference
     cudnn.benchmark = False
 
@@ -64,7 +64,7 @@ def main(args):
         ckpt_file, map_location=lambda storage, loc: storage.cuda(cfg["devices"][0])
     )
     print("Loading model ...")
-    model.load_state_dict(checkpoint["state_dict"])
+    model.load_state_dict(checkpoint["state_dict"]) 
     del checkpoint
 
     # set up evaluator

@@ -429,11 +429,17 @@ class FCOS(nn.Module):
                 subbox_y1 = repeated_target_subboxes[:,:,:,1]       # N_boxes x H x W
                 subbox_x2 = repeated_target_subboxes[:,:,:,2]       # N_boxes x H x W
                 subbox_y2 = repeated_target_subboxes[:,:,:,3]       # N_boxes x H x W
+                
+                repeated_target_boxes = target_boxes.view(-1, 1, 1, 4).repeat(1, H, W, 1)  
+                target_box_x1 = repeated_target_boxes[:,:,:,0]       # N_boxes x H x W
+                target_box_y1 = repeated_target_boxes[:,:,:,1]       # N_boxes x H x W
+                target_box_x2 = repeated_target_boxes[:,:,:,2]       # N_boxes x H x W
+                target_box_y2 = repeated_target_boxes[:,:,:,3]       # N_boxes x H x W
 
-                l = (point_x - subbox_x1) / layer_stride            # N_boxes x H x W
-                t = (point_y - subbox_y1) / layer_stride            # N_boxes x H x W
-                r = (subbox_x2 - point_x) / layer_stride            # N_boxes x H x W
-                b = (subbox_y2 - point_y) / layer_stride            # N_boxes x H x W
+                l = (point_x - target_box_x1)             # N_boxes x H x W
+                t = (point_y - target_box_y1)             # N_boxes x H x W
+                r = (target_box_x2 - point_x)             # N_boxes x H x W
+                b = (target_box_y2 - point_y)             # N_boxes x H x W
                 
                 # add extra dimension at the end so that concat on last dim returns tensor of shape (N_boxes x H x W x 4)
                 #why ??
@@ -454,6 +460,10 @@ class FCOS(nn.Module):
                     (point_x <= subbox_x2) &
                     (point_y >= subbox_y1) & 
                     (point_y <= subbox_y2) & 
+                    (point_x >= target_box_x1) & 
+                    (point_x <= target_box_x2) &
+                    (point_y >= target_box_y1) & 
+                    (point_y <= target_box_y2) & 
                     (max_dist >= layer_reg_range[0]) & 
                     (max_dist <= layer_reg_range[1]), 
                     True, False)
