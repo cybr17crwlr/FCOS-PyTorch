@@ -769,7 +769,6 @@ class FCOS(nn.Module):
             boxes = []
             scores = []
             labels = []
-            combination = []
             for layer_stride, box_regression_per_image_per_level, logits_per_image_per_level, box_ctrness_image_per_level, points_per_level in zip(strides, reg_outputs, cls_logits, ctr_logits, points):
                
                 box_regression_per_image = box_regression_per_image_per_level[index]
@@ -777,17 +776,16 @@ class FCOS(nn.Module):
                 box_ctrness_per_image = box_ctrness_image_per_level[index]
            
                 scores_per_level = torch.sqrt(
-                torch.sigmoid(logits_per_image) * torch.sigmoid(box_ctrness_per_image)).flatten()
-                print(scores_per_level.shape)
+                    torch.sigmoid(logits_per_image) * torch.sigmoid(box_ctrness_per_image)
+                ).flatten()
                
                 keep_idxs = scores_per_level > self.score_thresh
-                scores_per_level = scores_per_level
                 topk_idxs = torch.where(keep_idxs)[0] ##INDEXES
                
                 #TODO: Decode all boxes , then filtering ( reverse this )
                 pred_l, pred_t, pred_r, pred_b = box_regression_per_image
-                centerx = points_per_level[:,:,1]
-                centery = points_per_level[:,:,0]
+                centerx = points_per_level[:,:,0]
+                centery = points_per_level[:,:,1]
                 x1 = centerx - pred_l * layer_stride 
                 y1 = centery - pred_b * layer_stride
                 x2 = centerx + pred_r * layer_stride 
@@ -804,14 +802,12 @@ class FCOS(nn.Module):
             labels = torch.cat(labels, dim=0)  
             
             scores, idx = scores.topk(min(scores.size(0), self.topk_candidates))
-            print(idx.shape, 'idx count')
             boxes = boxes[idx]
             labels = labels[idx]
 
             filtered_set = batched_nms(boxes, scores, labels, self.nms_thresh)
             
             filtered_set = filtered_set[: self.detections_per_img]
-            print(labels[filtered_set].shape, "final length")
             detections.append(
                 {
                     'boxes': boxes[filtered_set],
